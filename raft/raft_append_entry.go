@@ -87,7 +87,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		return
 	}
 
-	rf.resetTimer(applierInterval)
+	rf.resetTimer(heartbeatInterval)
 
 	if rf.role != raftFollower {
 		rf.switchRole(raftFollower)

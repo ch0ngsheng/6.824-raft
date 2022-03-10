@@ -36,7 +36,7 @@ func candidateHandler(rf *Raft) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.resetTimer(applierInterval)
+	rf.resetTimer(heartbeatInterval)
 	rf.DPrintf("HB: <%d-%s>: (ignore)", rf.me, rf.getRole())
 }
 
@@ -46,9 +46,9 @@ func followerHandler(rf *Raft) {
 
 	// 再次检查，是不是刚刚收到了来自leader的心跳
 	now := time.Now().Unix()
-	if rf.timerResetTime.Add(applierInterval/2).Unix() > now {
+	if rf.timerResetTime.Add(heartbeatInterval/2).Unix() > now {
 		rf.DPrintf("Ignore this timeout, because just receive HB from leader")
-		rf.resetTimer(applierInterval)
+		rf.resetTimer(heartbeatInterval)
 		rf.mu.Unlock()
 		return
 	}
@@ -94,7 +94,7 @@ func followerHandler(rf *Raft) {
 	case voteResultFoundHigherTerm, voteResultLose:
 		rf.DPrintf("HB: <%d-%s>: vote end, be follower because of %d", rf.me, rf.getRole(), result)
 		rf.switchRole(raftFollower)
-		rf.resetTimer(applierInterval)
+		rf.resetTimer(heartbeatInterval)
 		rf.mu.Unlock()
 		return
 	case voteResultTimeout:
@@ -109,7 +109,7 @@ func followerHandler(rf *Raft) {
 		rf.DPrintf("HB: <%d-%s>: vote win", rf.me, rf.getRole())
 		rf.switchRole(raftLeader)
 		// 变成leader，立即发送心跳
-		rf.resetTimer(applierInterval)
+		rf.resetTimer(heartbeatInterval)
 		rf.mu.Unlock()
 
 		go appendEntry(rf)
@@ -122,12 +122,12 @@ func followerHandler(rf *Raft) {
 // leaderHandler leader的心跳定时器到期
 func leaderHandler(rf *Raft) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
 	rf.DPrintf("HB: <%d-%s>: (to append entry)", rf.me, rf.getRole())
 
 	// mark leader的心跳周期要比选举超时时间election timeout小。
-	rf.resetTimer(applierInterval)
+	rf.resetTimer(heartbeatInterval)
+	rf.mu.Unlock()
 
 	go appendEntry(rf)
 }

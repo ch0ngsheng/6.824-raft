@@ -33,7 +33,7 @@ func heatbeat(rf *Raft) {
 	rf.mu.Lock()
 
 	timer := rf.timer
-	rf.resetTimer(applierInterval)
+	rf.resetTimer(heartbeatInterval)
 
 	rf.mu.Unlock()
 
@@ -83,7 +83,7 @@ func requestVote(rf *Raft, returnChan chan int) {
 	requestVoteTimer := time.NewTimer(du)
 	defer requestVoteTimer.Stop() // mark 防止.C接收错乱 todo .C没有接收会怎样？事件会一直保留吗
 
-	rf.resetTimer(applierInterval)
+	rf.resetTimer(heartbeatInterval)
 	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {

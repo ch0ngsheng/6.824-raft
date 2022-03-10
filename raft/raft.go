@@ -18,12 +18,12 @@ package raft
 //
 
 import (
-	"6.824-raft/labgob"
 	"bytes"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"6.824-raft/labgob"
 	"6.824-raft/labrpc"
 )
 
