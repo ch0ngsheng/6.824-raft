@@ -1,9 +1,5 @@
 package raft
 
-import (
-	"fmt"
-)
-
 type AppendEntryArgs struct {
 	Term              uint64
 	LeaderID          int
@@ -20,52 +16,6 @@ type AppendEntryReply struct {
 	XIndex uint64
 	XTerm  uint64
 	XLen   uint64
-}
-
-type appendEntryInfo struct {
-	preLogIndex uint64
-	preLogTerm  uint64
-	entries     []*raftLog
-}
-
-func (rf *Raft) buildAppendEntryInfoByID(who int) *appendEntryInfo {
-	preLogIndex := rf.nextIndex[who] - 1
-	defer func() {
-		// used to debug
-		if err := recover(); err != nil {
-			fmt.Println(err, who, rf.me, rf.role, preLogIndex, len(rf.logs))
-			panic(err)
-		}
-	}()
-
-	preLogTerm := rf.logs[preLogIndex].Term
-	entries := make([]*raftLog, 0)
-	entries = append(entries, rf.logs[preLogIndex+1:]...)
-
-	info := &appendEntryInfo{
-		preLogIndex: preLogIndex,
-		preLogTerm:  preLogTerm,
-		entries:     entries,
-	}
-	return info
-}
-
-func (rf *Raft) buildAppendEntryInfo() map[int]*appendEntryInfo {
-	m := make(map[int]*appendEntryInfo)
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		m[i] = rf.buildAppendEntryInfoByID(i)
-	}
-	return m
-}
-
-func (rf *Raft) buildAppendEntryInfoLocked() map[int]*appendEntryInfo {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	return rf.buildAppendEntryInfo()
 }
 
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {

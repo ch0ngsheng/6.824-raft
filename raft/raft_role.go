@@ -31,6 +31,18 @@ func init() {
 	heartbeatHandlerMap[raftLeader] = leaderHandler
 }
 
+// leaderHandler leader的心跳定时器到期
+func leaderHandler(rf *Raft) {
+	rf.mu.Lock()
+	rf.DPrintf("HB: <%d-%s>: (to append entry)", rf.me, rf.getRole())
+
+	// mark leader的心跳周期要比选举超时时间election timeout小。
+	rf.resetTimer(heartbeatInterval)
+	rf.mu.Unlock()
+
+	go appendEntry(rf)
+}
+
 // candidateHandler candidate的心跳定时器到期
 func candidateHandler(rf *Raft) {
 	rf.mu.Lock()
@@ -117,17 +129,4 @@ func followerHandler(rf *Raft) {
 		rf.mu.Unlock()
 		panic(fmt.Sprintf("HB: unknown vote result %v", result))
 	}
-}
-
-// leaderHandler leader的心跳定时器到期
-func leaderHandler(rf *Raft) {
-	rf.mu.Lock()
-
-	rf.DPrintf("HB: <%d-%s>: (to append entry)", rf.me, rf.getRole())
-
-	// mark leader的心跳周期要比选举超时时间election timeout小。
-	rf.resetTimer(heartbeatInterval)
-	rf.mu.Unlock()
-
-	go appendEntry(rf)
 }

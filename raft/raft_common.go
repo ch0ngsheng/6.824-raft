@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// getRandomDuration 在base基础上随机增加若干时间，最大offset
+// getRandomDuration 在base基础上随机增加若干时间
 func getRandomDuration(base time.Duration, id int) time.Duration {
 	// rf.me作随机种子，保证每个节点种子不一样，足够随机
 	random := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))

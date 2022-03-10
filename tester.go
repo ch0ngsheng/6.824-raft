@@ -11,7 +11,7 @@ import (
 var goArg = "%s/loop.sh %s %s %d"
 
 func main() {
-	// ./loop -name=2A -c=2 -t=50
+	// ./tester -name=2A -c=2 -t=50
 	suitName := flag.String("name", "2A", "test suit name to run, e.g: 2A")
 	goNum := flag.Int("c", 1, "concurrent goroutines")
 	timesNum := flag.Int("t", 1, "test times per goroutines")

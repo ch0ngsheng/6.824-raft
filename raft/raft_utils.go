@@ -5,14 +5,6 @@ import (
 	"time"
 )
 
-// getLastLogNumberLocked 获取最后一条日志条目，返回索引号，任期号
-func (rf *Raft) getLastLogNumberLocked() (index uint64, term uint64) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	return rf.getLastLogNumber()
-}
-
 // getLastLogNumber 获取最后一条日志条目，返回索引号，任期号
 func (rf *Raft) getLastLogNumber() (index uint64, term uint64) {
 	lens := uint64(len(rf.logs))
@@ -24,12 +16,6 @@ func (rf *Raft) getRole() string {
 	return roleMap[role]
 }
 
-func (rf *Raft) switchRoleLocked(role uint32) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.switchRole(role)
-}
 func (rf *Raft) switchRole(role uint32) {
 	rf.role = role
 
@@ -57,12 +43,6 @@ func (rf *Raft) switchRole(role uint32) {
 	}
 }
 
-func (rf *Raft) updateMatchIndexLocked(who int, matchIndex uint64) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.updateMatchIndex(who, matchIndex)
-}
 func (rf *Raft) updateMatchIndex(who int, matchIndex uint64) {
 	rf.matchIndex[who] = matchIndex
 	rf.nextIndex[who] = matchIndex + 1
@@ -101,19 +81,6 @@ func (rf *Raft) updateCommitIndex() {
 	}
 }
 
-func (rf *Raft) updateCommitIndexLocked() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.updateCommitIndex()
-}
-
-func (rf *Raft) updateTermAndPersistLocked(term uint64) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.updateTermAndPersist(term)
-}
 func (rf *Raft) updateTermAndPersist(term uint64) {
 	rf.term = term
 	rf.votedFor = -1
@@ -125,12 +92,6 @@ func (rf *Raft) updateVotedForAndPersist(id int32) {
 	rf.persist()
 }
 
-func (rf *Raft) updateNextIndexLocked(who int, xIndex uint64, xTerm uint64, xLen uint64) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.updateNextIndex(who, xIndex, xTerm, xLen)
-}
 func (rf *Raft) updateNextIndex(who int, xIndex uint64, xTerm uint64, xLen uint64) {
 	if xLen != 0 {
 		rf.nextIndex[who] = xLen
