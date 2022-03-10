@@ -6,18 +6,18 @@ import (
 )
 
 const (
-	heartbeatInterval       = time.Millisecond * 100
-	heartbeatIntervalFloat  = 20
-	applierInterval         = time.Millisecond * 100
-	requestVoteTimeout      = heartbeatInterval * 2
-	requestVoteTimeoutFloat = 20
+	heartbeatInterval  = time.Millisecond * 100
+	requestVoteTimeout = time.Millisecond * 200
+	applierInterval    = time.Millisecond * 100
 )
 
 const (
 	// 节点被kill
 	voteResultKilled = iota + 1
-	// 选举被停止
-	voteResultStopped
+	// 选举响应过期，收到响应时自己的任期变高了
+	voteResultOutdated
+	// 选举期间发现自己不再是candidate
+	voteResultNotCandidate
 	// 选举超时
 	voteResultTimeout
 	// 选举获胜
@@ -25,43 +25,40 @@ const (
 	// 选举失败
 	voteResultLose
 	// 发现更高term，变为follower
-	voteResultBeFollower
+	voteResultFoundHigherTerm
 )
 
 // heatbeat 监控心跳事件
 func heatbeat(rf *Raft) {
+	rf.mu.Lock()
 
-	timer := rf.appendEntryTimer
-	du := rf.appendEntryTimerDuration
-	timer.Reset(du)
-	rf.DPrintf("<RST AE Timer><%d-%s> val: %v", rf.me, rf.getRole(), du)
-	rf.DPrintf("<%d-%s>: heartbeat monitor start", rf.me, rf.getRole())
+	timer := rf.timer
+	rf.resetTimer(applierInterval)
+
+	rf.mu.Unlock()
 
 	for {
 		select {
 		case <-timer.C:
 			// 角色可能发生了变化
-
 			rf.mu.Lock()
+
 			if rf.killed() {
 				rf.DPrintf("<%d-%s>: find killed when heartbeat %p", rf.me, rf.getRole(), rf)
 				rf.mu.Unlock()
 				return
 			}
-			// todo 如果是leader，把心跳间隔调小一点
 
-			du = rf.appendEntryTimerDuration
-			timer.Reset(du)
-			rf.DPrintf("<RST AE Timer><%d-%s> val: %v", rf.me, rf.getRole(), du)
-			role := rf.role
+			handler := heartbeatHandlerMap[rf.role]
 			rf.mu.Unlock()
 
-			go heartbeatHandlerMap[role](rf)
+			go handler(rf)
 		}
 	}
 }
 
 type requestVoteResult struct {
+	args *RequestVoteArgs
 	*RequestVoteReply
 	ok      bool
 	fromWho int
@@ -70,10 +67,6 @@ type requestVoteResult struct {
 // requestVote 发起投票，follower在心跳超时时执行
 func requestVote(rf *Raft, returnChan chan int) {
 	rf.mu.Lock()
-	rf.role = raftCandidate
-	rf.updateTerm(rf.term + 1)
-	rf.updateVotedFor(int32(rf.me))
-	rf.votingStopChan = make(chan struct{}, 1)
 
 	lastIndex, lastTerm := rf.getLastLogNumber()
 	request := &RequestVoteArgs{
@@ -82,14 +75,15 @@ func requestVote(rf *Raft, returnChan chan int) {
 		LastLogIndex: lastIndex,
 		LastLogTerm:  lastTerm,
 	}
-	rf.DPrintf("HB: <%d-%s>: rise vote at new term %d", rf.me, rf.getRole(), rf.term)
+	rf.DPrintf("HB: <%d-%s>: rise vote at new term %d, number%d", rf.me, rf.getRole(), rf.term, rf.requestVoteTimes)
 
 	resultChan := make(chan requestVoteResult, len(rf.peers)-1)
 
 	du := getRandomDuration(requestVoteTimeout, rf.me)
-	rf.requestVoteTimer.Reset(du)
-	rf.DPrintf("<RST RV Timer><%d-%s> val: %v", rf.me, rf.getRole(), du)
-	defer rf.requestVoteTimer.Stop()
+	requestVoteTimer := time.NewTimer(du)
+	defer requestVoteTimer.Stop() // mark 防止.C接收错乱 todo .C没有接收会怎样？事件会一直保留吗
+
+	rf.resetTimer(applierInterval)
 	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -100,6 +94,7 @@ func requestVote(rf *Raft, returnChan chan int) {
 			reply := &RequestVoteReply{}
 			ok := rf.sendRequestVote(server, request, reply)
 			result := requestVoteResult{
+				args:             request,
 				RequestVoteReply: reply,
 				ok:               ok,
 				fromWho:          server,
@@ -113,108 +108,142 @@ func requestVote(rf *Raft, returnChan chan int) {
 	votedNodes := []int{rf.me}
 	denyNodes := make([]int, 0)
 
+	ticker := time.NewTicker(time.Millisecond * 50)
+	defer ticker.Stop()
+
 	// mark 从发出RPC，到接收到RPC响应，raft的状态可能发生了变化
 	for {
-		rfc := rf.getInfoLocked()
-
 		if rf.killed() {
-			rf.DPrintf("<%d-%s>: found killed when request vote %p", rfc.me, rfc.getRole(), rf)
 			returnChan <- voteResultKilled
 			return
 		}
 
 		select {
-		case <-rf.requestVoteTimer.C:
+		case <-requestVoteTimer.C:
 			// 选举超时
 			returnChan <- voteResultTimeout
 			return
-		case <-rf.votingStopChan:
-			// 选举被中止，可能由于收到了来自leader的有效心跳
-			returnChan <- voteResultStopped
-			return
+		case <-ticker.C:
+			rf.mu.Lock()
+			if rf.role != raftCandidate {
+				rf.mu.Unlock()
+				returnChan <- voteResultNotCandidate
+				return
+			}
+			rf.mu.Unlock()
 		case res := <-resultChan:
-			rfc = rf.getInfoLocked()
-			if rfc.role == raftFollower {
+			rf.mu.Lock()
+			if rf.role != raftCandidate {
+				rf.mu.Unlock()
+				returnChan <- voteResultNotCandidate
+				return
+			}
+
+			if res.args.Term < rf.term {
+				// 来自之前发出的消息结果，网络是不可信的
+				rf.DPrintf("HB: <%d-%s>: term %d, receive old RV resp from %d with old term %d, ignore",
+					rf.me, rf.getRole(), rf.term, res.fromWho, res.args.Term)
+				rf.mu.Unlock()
+				//continue
+				// 这个协程已经是老的了，直接退出
+				returnChan <- voteResultOutdated
 				return
 			}
 
 			if !res.ok {
 				// 节点响应超时
 				denyNum += 1
-				rf.DPrintf("HB: <%d-%s>: term: %d, vote from %d, result: %s",
-					rf.me, rfc.getRole(), rfc.term, res.fromWho, "node not ok")
-
-				continue
-			}
-			if res.Term > atomic.LoadUint64(&rf.term) {
-				// 发现更高term，变为follower
-				rf.DPrintf("HB: <%d-%s>: term: %d, vote quit because higher term %d",
-					rfc.me, rfc.getRole(), rfc.term, res.Term)
-
-				returnChan <- voteResultBeFollower
-				return
-			}
-			if res.Voted {
-				votedNum += 1
-				votedNodes = append(votedNodes, res.fromWho)
-				rf.DPrintf("HB: <%d-%s>: term: %d, vote resp from %d %s",
-					rfc.me, rfc.getRole(), rfc.term, res.fromWho, "voted")
-			} else {
-				denyNum += 1
 				denyNodes = append(denyNodes, res.fromWho)
-				rf.DPrintf("HB: <%d-%s>: term: %d, vote resp from %d %s",
-					rfc.me, rfc.getRole(), rfc.term, res.fromWho, "deny")
+				rf.DPrintf("HB: <%d-%s>: term: %d, vote from %d, result: %s",
+					rf.me, rf.getRole(), rf.term, res.fromWho, "node not ok")
+			} else {
+				if res.Term > atomic.LoadUint64(&rf.term) {
+					rf.DPrintf("HB: <%d-%s>: term: %d, vote quit because higher term %d",
+						rf.me, rf.getRole(), rf.term, res.Term)
+					rf.updateTermAndPersist(res.Term) // mark 收到高term响应
+					rf.mu.Unlock()
+					returnChan <- voteResultFoundHigherTerm
+					return
+				}
+				if res.Voted {
+					votedNum += 1
+					votedNodes = append(votedNodes, res.fromWho)
+					rf.DPrintf("HB: <%d-%s>: term: %d, vote resp from %d %s",
+						rf.me, rf.getRole(), rf.term, res.fromWho, "voted")
+				} else {
+					denyNum += 1
+					denyNodes = append(denyNodes, res.fromWho)
+					rf.DPrintf("HB: <%d-%s>: term: %d, vote resp from %d %s",
+						rf.me, rf.getRole(), rf.term, res.fromWho, "deny")
+				}
 			}
+
 			if votedNum > len(rf.peers)/2 {
 				// 当选
 				rf.DPrintf("HB: <%d-%s>: term: %d, voted: %v, deny: %v result: %s",
-					rfc.me, rfc.getRole(), rfc.term, votedNodes, denyNodes, "win!")
-
+					rf.me, rf.getRole(), rf.term, votedNodes, denyNodes, "win!")
+				rf.mu.Unlock()
 				returnChan <- voteResultWin
 				return
 			}
 			if denyNum > len(rf.peers)/2 {
 				// 未当选
 				rf.DPrintf("HB: <%d-%s>: term: %d, voted: %v, deny: %v result: %s",
-					rfc.me, rfc.getRole(), rfc.term, votedNodes, denyNodes, "lose!")
-
+					rf.me, rf.getRole(), rf.term, votedNodes, denyNodes, "lose!")
+				rf.mu.Unlock()
 				returnChan <- voteResultLose
 				return
 			}
+			rf.mu.Unlock()
 		}
 	}
 }
 
 // appendEntry 追加日志条目
 func appendEntry(rf *Raft) {
-	rfc := rf.getInfoLocked()
-	originTerm, originCommitIndex, role := rfc.term, rfc.commitIndex, rfc.role
-	if !(role == raftLeader) {
+	rf.mu.Lock()
+
+	if !(rf.role == raftLeader) {
+		rf.mu.Unlock()
 		return
 	}
 
-	atomic.StoreUint32(&rf.appendEntryTimes, atomic.LoadUint32(&rf.appendEntryTimes)+1)
+	oldTerm := rf.term
+	rf.appendEntryTimes += 1
 
-	rf.appendEntryStopChan = make(chan struct{}, 1)
+	rf.DPrintf("[HB AE Begin]>>> term: %d, leader: %d/ae-%dth, commitIndex: %d, leader len(logs): %d", rf.term, rf.me, rf.appendEntryTimes, rf.commitIndex, len(rf.logs))
 
-	rf.DPrintf("[HB AE Begin]>>> term: %d, leader: %d/ae-%dth, commitIndex: %d", originTerm, rfc.me, rfc.appendEntryTimes, originCommitIndex)
+	// mark leaderCommitIndex 和 日志追加信息要在一次锁中获取，防止中间有更新
+	infoMap := rf.buildAppendEntryInfo()
+	peerLen, me, commitIndex := len(rf.peers), rf.me, rf.commitIndex
+	rf.mu.Unlock()
 
-	infoMap := rf.buildAppendEntryInfoLocked()
-	resultChan := make(chan *appendEntryResult, len(rf.peers)-1)
+	resultChan := make(chan *appendEntryResult, peerLen-1)
 	finishedMap := make(map[int]bool)
 
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
+	for i := 0; i < peerLen; i++ {
+		if i == me {
 			continue
 		}
-		go appendEntryToNode(rf, i, infoMap[i], resultChan)
+
+		go func(no int, term uint64) {
+			args := &AppendEntryArgs{
+				Term:              term,
+				LeaderID:          me,
+				PreLogIndex:       infoMap[no].preLogIndex,
+				PreLogTerm:        infoMap[no].preLogTerm,
+				Entries:           infoMap[no].entries,
+				LeaderCommitIndex: commitIndex,
+			}
+			appendEntryToNodeLocked(rf, no, args, resultChan)
+		}(i, oldTerm)
 	}
 
-	ticker := time.NewTicker(time.Millisecond * 100)
+	ticker := time.NewTicker(time.Millisecond * 50)
 	defer ticker.Stop()
 
 	for {
-		if len(finishedMap) == len(rf.peers)-1 {
+		if len(finishedMap) == peerLen-1 {
 			// 全部节点已处理完成
 			break
 		}
@@ -225,12 +254,15 @@ func appendEntry(rf *Raft) {
 			if rf.killed() {
 				return
 			}
+			rf.mu.Lock()
+			if rf.role != raftLeader {
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
 			continue
 		case result = <-resultChan:
 			break // 退出select clause
-		case <-rf.appendEntryStopChan:
-			// 停止发送
-			return
 		}
 		if rf.killed() {
 			return
@@ -238,70 +270,79 @@ func appendEntry(rf *Raft) {
 
 		// mark 收到响应时，节点状态可能发生了变化
 
-		if atomic.LoadUint32(&rf.role) != raftLeader {
-			// mark 已不是leader，停止发送。防止因自己的日志回滚导致计算preLogIndex过大触发越界。
+		rf.mu.Lock()
+		if rf.role != raftLeader {
+			// mark 已不是leader，停止发送。防止因自己的日志回滚导致后面计算preLogIndex过大触发越界。
+			rf.DPrintf("[HB AE RESP] term: %d, me: %d/ae-%dth, NOT leader anymore", rf.term, rf.me, rf.appendEntryTimes)
+			rf.mu.Unlock()
 			return
 		}
 
-		rfc = rf.getInfoLocked()
+		if rf.term > result.args.Term {
+			// 收到了自己之前任期时发出的RPC响应，放弃处理这次响应。这次响应延迟太多了
+			// finishedMap[result.fromWho] = true
+			rf.DPrintf("[HB AE RESP] term: %d, leader: %d, receive old resp with term %d, IGNORE", rf.term, rf.me, result.args.Term)
+			rf.mu.Unlock()
+			//continue
+			// 交给新的goroutine处理
+			return
+		}
+
 		// 失败，网络不可达，本次忽略这个节点
 		if !result.ok {
 			finishedMap[result.fromWho] = true
-			rf.DPrintf("[HB AE] term: %d, leader: %d/ae-%dth, node %d network down", originTerm, rfc.me, rfc.appendEntryTimes, result.fromWho)
+			rf.DPrintf("[HB AE RESP] term: %d, leader: %d/ae-%dth, node %d network down", oldTerm, rf.me, rf.appendEntryTimes, result.fromWho)
+			rf.mu.Unlock()
 			continue
 		}
 
 		// 成功，更新对应节点的nextIndex[i]和matchIndex[i]
 		if result.reply.Success {
+
 			matchIndex := result.args.PreLogIndex + uint64(len(result.args.Entries))
-			rf.updateMatchIndexLocked(result.fromWho, matchIndex)
+			rf.updateMatchIndex(result.fromWho, matchIndex)
 			finishedMap[result.fromWho] = true
 
 			// mark 注意，更新commitIndex不应该等到所有节点都响应之后才做
 			// 不然会导致集群一直不一致，因为节点故障后一直不会响应。
 			// 根据matchIndex[i]更新自己的commitIndex
-			rf.updateCommitIndexLocked()
-			rf.DPrintf("HB AE: leader: %d/ae-%dth, node %d reply success, now commitIndex is %d/%d", rfc.me, rfc.appendEntryTimes, result.fromWho, rfc.commitIndex, len(rfc.logs))
-
+			rf.updateCommitIndex()
+			rf.DPrintf("[HB AE RESP] leader: %d/ae-%dth, node %d reply success, now commitIndex is %d/%d，matchIndex: %v", rf.me, rf.appendEntryTimes, result.fromWho, rf.commitIndex, len(rf.logs), rf.matchIndex)
+			rf.mu.Unlock()
 			continue
 		}
 
 		// 以下处理，返回的Success值为false的情况
-		rfc = rf.getInfoLocked()
-		curTerm := rfc.term // 重新获取当前任期
-		if curTerm > result.args.Term {
-			// 收到了自己之前任期时发出的RPC响应，放弃处理这次响应。这次响应延迟太多了
-			finishedMap[result.fromWho] = true
-			continue
-		}
-		if curTerm < result.reply.Term {
+		if rf.term < result.reply.Term {
 			// 对端任期更高，转为follower
-			rf.mu.Lock()
-			rf.updateTerm(result.reply.Term)
+			rf.DPrintf("[HB AE RESP] term: %d, me: %d, receive higher term %d from %d, be follower", rf.term, rf.me, result.reply.Term, result.fromWho)
 			rf.switchRole(raftFollower)
+			rf.updateTermAndPersist(result.reply.Term)
 			rf.mu.Unlock()
 			return
 		} else {
 			// 当前任期与对端一致，但是没有成功，说明对端日志冲突，重试
-			rf.updateNextIndexLocked(result.fromWho, result.reply.XIndex, result.reply.XTerm, result.reply.XLen)
-
-			var entryInfo *appendEntryInfo
-			rf.mu.Lock()
-			entryInfo = rf.buildAppendEntryInfoByID(result.fromWho)
+			rf.updateNextIndex(result.fromWho, result.reply.XIndex, result.reply.XTerm, result.reply.XLen)
+			rf.DPrintf("[HB AE RESP CONFLICT]me %d, from %d XIdx %d XTerm %d XLen %d, len(logs) %d newNextIndex %d",
+				rf.me, result.fromWho, result.reply.XIndex, result.reply.XTerm, result.reply.XLen, len(rf.logs), rf.nextIndex[result.fromWho])
+			entryInfo := rf.buildAppendEntryInfoByID(result.fromWho)
+			cmtIdxNow := rf.commitIndex
+			termNow := rf.term
 			rf.mu.Unlock()
 
-			go appendEntryToNode(rf, result.fromWho, entryInfo, resultChan)
+			go func(cmtIdx, term uint64) {
+				args := &AppendEntryArgs{
+					Term:              term,
+					LeaderID:          me,
+					PreLogIndex:       entryInfo.preLogIndex,
+					PreLogTerm:        entryInfo.preLogTerm,
+					Entries:           entryInfo.entries,
+					LeaderCommitIndex: cmtIdx,
+				}
+				appendEntryToNodeLocked(rf, result.fromWho, args, resultChan)
+			}(cmtIdxNow, termNow)
 		}
-
 	}
-
-	// 改为每成功一次，就做一次
-	// 根据matchIndex[i]更新自己的commitIndex
-	// rf.updateCommitIndexLocked()
-
-	rfc = rf.getInfoLocked()
-	rf.DPrintf(">>>[HB AE End] originTerm: %d, me: %d/ae-%dth, isLeader %v, endTerm: %d, endCommitIndex: %d, nodes: %v",
-		originTerm, rfc.me, rfc.appendEntryTimes, rfc.role == raftLeader, rfc.term, rfc.commitIndex, finishedMap)
 }
 
 type appendEntryResult struct {
@@ -311,18 +352,7 @@ type appendEntryResult struct {
 	ok      bool
 }
 
-func appendEntryToNode(rf *Raft, who int, entryInfo *appendEntryInfo, resultChan chan *appendEntryResult) {
-	rfc := rf.getInfoLocked()
-	term, commitIndex := rfc.term, rfc.commitIndex
-
-	args := &AppendEntryArgs{
-		Term:              term,
-		LeaderID:          rf.me,
-		PreLogIndex:       entryInfo.preLogIndex,
-		PreLogTerm:        entryInfo.preLogTerm,
-		Entries:           entryInfo.entries,
-		LeaderCommitIndex: commitIndex,
-	}
+func appendEntryToNodeLocked(rf *Raft, who int, args *AppendEntryArgs, resultChan chan *appendEntryResult) {
 	reply := &AppendEntryReply{}
 	// have a delay
 	ok := rf.sendAppendEntry(who, args, reply)
@@ -338,8 +368,9 @@ func appendEntryToNode(rf *Raft, who int, entryInfo *appendEntryInfo, resultChan
 
 // applier 应用已提交的日志条目
 func applier(rf *Raft) {
-	rfc := rf.getInfoLocked()
-	rf.DPrintf("<%d-%s>: applier start", rfc.me, rfc.getRole())
+	rf.mu.Lock()
+	rf.DPrintf("<%d-%s>: applier start", rf.me, rf.getRole())
+	rf.mu.Unlock()
 
 	ticker := time.NewTicker(applierInterval)
 	defer ticker.Stop()
@@ -350,8 +381,8 @@ func applier(rf *Raft) {
 			rf.mu.Lock()
 
 			if rf.killed() {
-				rf.mu.Unlock()
 				rf.DPrintf("<%d-%s>: applier exit because node is killed %p", rf.me, rf.getRole(), rf)
+				rf.mu.Unlock()
 				return
 			}
 

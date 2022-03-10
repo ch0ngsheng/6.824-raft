@@ -10,11 +10,11 @@ import (
 
 // getRandomDuration 在base基础上随机增加若干时间，最大offset
 func getRandomDuration(base time.Duration, id int) time.Duration {
-	span := 10
-	o := int64(rand.Intn(span) + (id%3)*40)
-	//oo := time.Duration(100*rand.Intn(200)) * time.Microsecond
+	// rf.me作随机种子，保证每个节点种子不一样，足够随机
+	random := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
+	randomVal := random.Intn(60)
 
-	return time.Duration(o)*time.Millisecond + base
+	return time.Duration(randomVal)*time.Millisecond + base
 }
 
 func (rf *Raft) DPrintf(format string, a ...interface{}) {

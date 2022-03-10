@@ -65,40 +65,41 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	role                     uint32
-	term                     uint64 // 持久化
-	votedFor                 int32  // -1代表本任期内未投票 // 持久化
-	appendEntryTimer         *time.Timer
-	appendEntryTimerDuration time.Duration
-	requestVoteTimer         *time.Timer
-	logs                     []*raftLog        // 持久化
-	logTermsLast             map[uint64]uint64 // 记录日志中的term号，及该任期内的最后一条日志索引位置 // 持久化
-	logTermsFirst            map[uint64]uint64 // 记录日志中的term号，及该任期内的第一条日志索引位置 // 持久化
-	votingStopChan           chan struct{}     // 控制选举停止的chan，用于收到合法心跳后停止candidate正在进行的选举
-	appendEntryStopChan      chan struct{}     // 控制发送心跳停止的chan，用于收到合法心跳后停止leader正在发送的心跳
-	commitIndex              uint64
-	lastApplied              uint64
-	applyMsgChan             chan ApplyMsg
+	role uint32 // 当前角色
 
-	// leader的属性
-	nextIndex  []uint64
-	matchIndex []uint64
+	timer          *time.Timer // 选举定时器
+	timerResetTime time.Time   // 选举定时器重置时间
 
-	appendEntryTimes uint32
+	// 持久化字段
+	term     uint64     // 当前任期
+	votedFor int32      // 本任期投票给了哪个节点，-1代表本任期内未投票
+	logs     []*raftLog // 日志条目
+
+	// 持久化字段，非Raft必须，仅用于优化
+	logTermsLast  map[uint64]uint64 // 记录日志中的term号，及该任期内的最后一条日志索引位置
+	logTermsFirst map[uint64]uint64 // 记录日志中的term号，及该任期内的第一条日志索引位置
+
+	nextIndex    []uint64      // leader维护的下一次AppendEntry需要发送给各节点的日志条目索引
+	matchIndex   []uint64      // leader维护的各节点日志条目已同步的最高索引
+	commitIndex  uint64        // 日志条目已提交索引
+	lastApplied  uint64        // 本节点日志条目已应用索引
+	applyMsgChan chan ApplyMsg // 本节点日志条目应用目标chan
+
+	// 用于调试记录的字段
+	appendEntryTimes uint32 // 发起追加日志条目RPC次数
+	requestVoteTimes uint64 // 发起请求选举RPC次数
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (termNo int, isLeader bool) {
-	var term int
-	var isleader bool
 	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	term = int(rf.term)
-	isleader = rf.role == raftLeader
-	return term, isleader
+	termNo = int(rf.term)
+	isLeader = rf.role == raftLeader
+	return
 }
 
 //
@@ -182,6 +183,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if err := d.Decode(&logTermsLast); err != nil {
 		panic(err)
 	}
+
 	rf.term, rf.votedFor, rf.logs = term, votedFor, logs
 	rf.logTermsFirst, rf.logTermsLast = logTermsFirst, logTermsLast
 
@@ -226,7 +228,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, leader bool) {
 		rf.logTermsFirst[rf.term] = uint64(index)
 	}
 	rf.logTermsLast[rf.term] = uint64(index)
-	// 持久化
+
 	rf.persist()
 
 	// leader's matchIndex
@@ -251,9 +253,9 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 
-	//atomic.StoreUint32(&rf.role, raftFollower)
-	rfc := rf.getInfoLocked()
-	rf.DPrintf("<%d-%s>: signal killed %p", rfc.me, rfc.getRole(), rf)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.DPrintf("<%d-%s>: signal killed %p", rf.me, rf.getRole(), rf)
 }
 
 func (rf *Raft) killed() bool {
@@ -287,13 +289,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.term = 0
 
-	rf.appendEntryTimerDuration = getRandomDuration(heartbeatInterval, rf.me)
-	rf.appendEntryTimer = time.NewTimer(rf.appendEntryTimerDuration)
-	rf.requestVoteTimer = time.NewTimer(
-		getRandomDuration(requestVoteTimeout, rf.me),
-	)
-	rf.appendEntryTimer.Stop()
-	rf.requestVoteTimer.Stop()
+	rf.timer = time.NewTimer(getRandomDuration(heartbeatInterval, rf.me))
+	rf.timer.Stop()
 
 	rf.logs = []*raftLog{{0, 0}} // log索引从1开始
 	rf.logTermsFirst = map[uint64]uint64{0: 0}
@@ -301,20 +298,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.nextIndex = make([]uint64, len(rf.peers))
 	rf.matchIndex = make([]uint64, len(rf.peers))
+
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = uint64(len(rf.logs)) // 初始值为leader最后一个日志条目的索引值+1
 		rf.matchIndex[i] = 0
 	}
 
+	go heatbeat(rf) // 心跳检测
+
+	go applier(rf) // 日志应用
+
 	rf.DPrintf("RAFT >>>>>>> %d", rf.me)
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
-	// 心跳检测
-	go heatbeat(rf)
-	// 日志应用
-	go applier(rf)
-
 	return rf
 }

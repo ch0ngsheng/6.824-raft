@@ -1,13 +1,9 @@
 package raft
 
-import "sync/atomic"
-
-// getInfoLocked 获取rf的拷贝
-func (rf *Raft) getInfoLocked() (raft *Raft) {
-	//rf.mu.Lock()
-	//defer rf.mu.Unlock()
-	return rf
-}
+import (
+	"sync/atomic"
+	"time"
+)
 
 // getLastLogNumberLocked 获取最后一条日志条目，返回索引号，任期号
 func (rf *Raft) getLastLogNumberLocked() (index uint64, term uint64) {
@@ -44,6 +40,20 @@ func (rf *Raft) switchRole(role uint32) {
 			rf.nextIndex[i] = uint64(len(rf.logs)) // 初始值为leader最后一个日志条目的索引值+1
 			rf.matchIndex[i] = 0
 		}
+		rf.matchIndex[rf.me] = uint64(len(rf.logs) - 1)
+
+		// 重置logTermsFirst, logTermsLast
+		rf.logTermsFirst = make(map[uint64]uint64)
+		rf.logTermsLast = make(map[uint64]uint64)
+		for i := 0; i < len(rf.logs); i++ {
+			log := rf.logs[i]
+			if _, ok := rf.logTermsFirst[log.Term]; !ok {
+				rf.logTermsFirst[log.Term] = uint64(i)
+			}
+			rf.logTermsLast[log.Term] = uint64(i)
+		}
+
+		rf.persist()
 	}
 }
 
@@ -51,51 +61,66 @@ func (rf *Raft) updateMatchIndexLocked(who int, matchIndex uint64) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	rf.updateMatchIndex(who, matchIndex)
+}
+func (rf *Raft) updateMatchIndex(who int, matchIndex uint64) {
 	rf.matchIndex[who] = matchIndex
 	rf.nextIndex[who] = matchIndex + 1
+}
+
+func (rf *Raft) updateCommitIndex() {
+	/*
+		Fig.8的要求，只通过当前term的日志判断是否更新commitIndex
+			If there exists an N such that
+				N > commitIndex,
+				a majority of matchIndex[i] ≥ N,
+				and log[N].term == currentTerm:
+			set commitIndex = N
+
+		实际实现时做了扩展：
+			如果全部节点都满足 matchIndex[i] >= N，set commitIndex = N
+			此时不要求log[N].Term == currentTerm
+	*/
+	for i := rf.commitIndex + 1; i < uint64(len(rf.logs)); i++ {
+		/*if rf.logs[i].Term != rf.term {
+			continue
+		}*/
+
+		var cnt int
+		for j := 0; j < len(rf.peers); j++ {
+			if rf.matchIndex[j] >= i {
+				cnt += 1
+			}
+		}
+		if rf.logs[i].Term == rf.term && cnt > len(rf.peers)/2 {
+			rf.commitIndex = i
+		} else if rf.logs[i].Term != rf.term && cnt == len(rf.peers) {
+			rf.commitIndex = i
+			rf.DPrintf("ALL MATCH, update commitIndex from earlier term %d", rf.logs[i].Term)
+		}
+	}
 }
 
 func (rf *Raft) updateCommitIndexLocked() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	/*
-		If there exists an N such that
-			N > commitIndex,
-			a majority of matchIndex[i] ≥ N,
-			and log[N].term == currentTerm:
-		set commitIndex = N
-	*/
-	for i := rf.commitIndex + 1; i < uint64(len(rf.logs)); i++ {
-		if rf.logs[i].Term != rf.term {
-			continue
-		}
-
-		var cnt int
-		for j := 0; j < len(rf.peers); j++ {
-			if rf.matchIndex[j] >= i {
-				cnt += 1
-				if cnt > len(rf.peers)/2 {
-					rf.commitIndex = i
-				}
-			}
-		}
-	}
+	rf.updateCommitIndex()
 }
 
-func (rf *Raft) updateTermLocked(term uint64) {
+func (rf *Raft) updateTermAndPersistLocked(term uint64) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.updateTerm(term)
+	rf.updateTermAndPersist(term)
 }
-func (rf *Raft) updateTerm(term uint64) {
+func (rf *Raft) updateTermAndPersist(term uint64) {
 	rf.term = term
 	rf.votedFor = -1
 
 	rf.persist()
 }
-func (rf *Raft) updateVotedFor(id int32) {
+func (rf *Raft) updateVotedForAndPersist(id int32) {
 	rf.votedFor = id
 	rf.persist()
 }
@@ -104,6 +129,9 @@ func (rf *Raft) updateNextIndexLocked(who int, xIndex uint64, xTerm uint64, xLen
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	rf.updateNextIndex(who, xIndex, xTerm, xLen)
+}
+func (rf *Raft) updateNextIndex(who int, xIndex uint64, xTerm uint64, xLen uint64) {
 	if xLen != 0 {
 		rf.nextIndex[who] = xLen
 		return
@@ -113,4 +141,16 @@ func (rf *Raft) updateNextIndexLocked(who int, xIndex uint64, xTerm uint64, xLen
 		return
 	}
 	rf.nextIndex[who] = xIndex
+}
+
+func (rf *Raft) resetTimer(t time.Duration) {
+	du := getRandomDuration(t, rf.me)
+
+	if rf.role == raftLeader {
+		du = du / 2
+	}
+	rf.timer.Reset(du)
+	rf.timerResetTime = time.Now()
+
+	rf.DPrintf("<RST AE Timer><%d-%s> val: %v", rf.me, rf.getRole(), du)
 }

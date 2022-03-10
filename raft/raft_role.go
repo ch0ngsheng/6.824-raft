@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -32,64 +33,101 @@ func init() {
 
 // candidateHandler candidate的心跳定时器到期
 func candidateHandler(rf *Raft) {
-	rfc := rf.getInfoLocked()
-	rf.DPrintf("HB: <%d-%s>: (ignore)", rfc.me, rfc.getRole())
-	// 正在选举，忽略心跳到期事件
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	rf.resetTimer(applierInterval)
+	rf.DPrintf("HB: <%d-%s>: (ignore)", rf.me, rf.getRole())
 }
 
 // followerHandler follower的心跳定时器到期
 func followerHandler(rf *Raft) {
-	rfc := rf.getInfoLocked()
-	rf.DPrintf("HB: <%d-%s>: (to rise election)", rfc.me, rfc.getRole())
-	// 转为candidate，发起新的选举
+	rf.mu.Lock()
+
+	// 再次检查，是不是刚刚收到了来自leader的心跳
+	now := time.Now().Unix()
+	if rf.timerResetTime.Add(applierInterval/2).Unix() > now {
+		rf.DPrintf("Ignore this timeout, because just receive HB from leader")
+		rf.resetTimer(applierInterval)
+		rf.mu.Unlock()
+		return
+	}
+
+	rf.requestVoteTimes += 1
+	rf.switchRole(raftCandidate)
+	rf.updateTermAndPersist(rf.term + 1)
+	rf.updateVotedForAndPersist(int32(rf.me))
+	rf.DPrintf("HB: <%d-%s>: (to rise election) at term %d", rf.me, rf.getRole(), rf.term)
+	rf.mu.Unlock()
 
 	resultChan := make(chan int, 0)
 	go requestVote(rf, resultChan)
 
-	ticker := time.NewTicker(time.Millisecond * 100)
+	ticker := time.NewTicker(time.Millisecond * 60)
 	var result int
 	loop := true
 	for loop {
 		select {
-		case <-ticker.C:
-			rfc = rf.getInfoLocked()
+		case <-ticker.C: // todo 如果到期后，没有取走，后面还会取到前面错过的事件吗？
+			rf.mu.Lock()
 			if rf.killed() {
-				rf.DPrintf("HB: <%d-%s>: found killed when waiting vote result %p", rfc.me, rfc.getRole(), rf)
+				rf.DPrintf("HB: <%d-%s>: found killed when waiting vote result %p", rf.me, rf.getRole(), rf)
+				rf.mu.Unlock()
 				return
 			}
+			if rf.role == raftFollower {
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
 		case result = <-resultChan:
 			loop = false
 		}
 	}
 	ticker.Stop()
-	// rf.DPrintf("HB: <%d-%s>: vote result: %d.", rf.me, rf.getRole(), result)
 
-	rfc = rf.getInfoLocked()
+	rf.mu.Lock()
 	switch result {
-	case voteResultKilled:
+	case voteResultKilled, voteResultNotCandidate, voteResultOutdated:
+		rf.mu.Unlock()
 		return
-	case voteResultStopped, voteResultBeFollower, voteResultLose:
-		rf.DPrintf("HB: <%d-%s>: vote end, be follower because of %d", rfc.me, rfc.getRole(), result)
-		rf.switchRoleLocked(raftFollower)
+	case voteResultFoundHigherTerm, voteResultLose:
+		rf.DPrintf("HB: <%d-%s>: vote end, be follower because of %d", rf.me, rf.getRole(), result)
+		rf.switchRole(raftFollower)
+		rf.resetTimer(applierInterval)
+		rf.mu.Unlock()
+		return
 	case voteResultTimeout:
-		// 重新选举
-		rf.DPrintf("HB: <%d-%s>: vote timeout, try again", rfc.me, rfc.getRole())
-		rf.switchRoleLocked(raftFollower)
-		followerHandler(rf)
+		// 等待超时下次重新选举
+		rf.DPrintf("HB: <%d-%s>: vote timeout at number%d, try again", rf.me, rf.getRole(), rf.requestVoteTimes)
+		rf.switchRole(raftFollower)
+		rf.mu.Unlock()
+		//mark 这里不要马上开始下一轮，而是等待当前心跳自动超时（在选举开始时和选举期间，心跳到期后都会自动重置）
+		//followerHandler(rf)
+		return
 	case voteResultWin:
-		rf.DPrintf("HB: <%d-%s>: vote win", rfc.me, rfc.getRole())
-		rf.switchRoleLocked(raftLeader)
+		rf.DPrintf("HB: <%d-%s>: vote win", rf.me, rf.getRole())
+		rf.switchRole(raftLeader)
 		// 变成leader，立即发送心跳
+		rf.resetTimer(applierInterval)
+		rf.mu.Unlock()
+
 		go appendEntry(rf)
 	default:
-		panic("HB: unknown vote result")
+		rf.mu.Unlock()
+		panic(fmt.Sprintf("HB: unknown vote result %v", result))
 	}
 }
 
 // leaderHandler leader的心跳定时器到期
 func leaderHandler(rf *Raft) {
-	rfc := rf.getInfoLocked()
-	rf.DPrintf("HB: <%d-%s>: (to append entry)", rfc.me, rfc.getRole())
-	go appendEntry(rf)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	rf.DPrintf("HB: <%d-%s>: (to append entry)", rf.me, rf.getRole())
+
+	// mark leader的心跳周期要比选举超时时间election timeout小。
+	rf.resetTimer(applierInterval)
+
+	go appendEntry(rf)
 }

@@ -1,6 +1,8 @@
 package raft
 
-import "fmt"
+import (
+	"fmt"
+)
 
 type AppendEntryArgs struct {
 	Term              uint64
@@ -27,10 +29,9 @@ type appendEntryInfo struct {
 }
 
 func (rf *Raft) buildAppendEntryInfoByID(who int) *appendEntryInfo {
-
 	preLogIndex := rf.nextIndex[who] - 1
-	// todo delete
 	defer func() {
+		// used to debug
 		if err := recover(); err != nil {
 			fmt.Println(err, who, rf.me, rf.role, preLogIndex, len(rf.logs))
 			panic(err)
@@ -49,10 +50,7 @@ func (rf *Raft) buildAppendEntryInfoByID(who int) *appendEntryInfo {
 	return info
 }
 
-func (rf *Raft) buildAppendEntryInfoLocked() map[int]*appendEntryInfo {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
+func (rf *Raft) buildAppendEntryInfo() map[int]*appendEntryInfo {
 	m := make(map[int]*appendEntryInfo)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -63,13 +61,24 @@ func (rf *Raft) buildAppendEntryInfoLocked() map[int]*appendEntryInfo {
 	return m
 }
 
+func (rf *Raft) buildAppendEntryInfoLocked() map[int]*appendEntryInfo {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	return rf.buildAppendEntryInfo()
+}
+
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.DPrintf("Receive AE>>>, me: %d, from L: %d, term: %d, logs: %s", rf.me, args.LeaderID, args.Term, logsToString(args.Entries))
+	rf.DPrintf("Receive AE>>>   me: %d, from L: %d, term: %d, preLogIdx:%d, preLogTerm:%d, leaderCommitIdx:%d, logs: %s",
+		rf.me, args.LeaderID, args.Term, args.PreLogIndex, args.PreLogTerm, args.LeaderCommitIndex, logsToString(args.Entries),
+	)
 	defer func() {
-		rf.DPrintf(">>>Receive AE, me: %d, from L: %d, resp: %v, commitIndex %d, final logs len %d, logs: %v", rf.me, args.LeaderID, reply, rf.commitIndex, len(rf.logs), logsToString(rf.logs))
+		rf.DPrintf(">>>Receive AE   me: %d, from L: %d, resp: %v, commitIndex %d, final logs len %d, logs: %v",
+			rf.me, args.LeaderID, reply, rf.commitIndex, len(rf.logs), logsToString(rf.logs),
+		)
 	}()
 
 	if args.Term < rf.term {
@@ -78,27 +87,15 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		return
 	}
 
-	oldRole := rf.role
-	if args.Term > rf.term {
-		rf.updateTerm(args.Term)
+	rf.resetTimer(applierInterval)
+
+	if rf.role != raftFollower {
 		rf.switchRole(raftFollower)
 	}
 
-	// 重置定时器
-	du := rf.appendEntryTimerDuration
-	rf.DPrintf("<RST AE Timer><%d-%s> val: %v", rf.me, rf.getRole(), du)
-	rf.appendEntryTimer.Reset(du)
-	// 停止选举
-	if oldRole == raftCandidate {
-		go func() {
-			rf.votingStopChan <- struct{}{}
-		}()
-	}
-	// mark 停止发送AE
-	if oldRole == raftLeader {
-		go func() {
-			rf.appendEntryStopChan <- struct{}{}
-		}()
+	if args.Term > rf.term {
+		rf.switchRole(raftFollower)
+		rf.updateTermAndPersist(args.Term)
 	}
 
 	if args.PreLogIndex == 0 {
@@ -140,18 +137,17 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.logTermsLast[log.Term] = i
 	}
 
-	// 持久化
 	rf.persist()
 
-	// 更新commitIndex，只有在leader的commitIndex更大时进行
-	// 存在一种情况，老的leader仅增加了自己的commitIdx后就下台了，导致比新的leader的commitIdx大
-	// 此时不能使用新leader的commitIdx，因为后面的日志可能已被应用。
+	// 如果leader的commitIndex更小，则不修改。否则可能导致本节点日志重复应用
+	// commitIndex在leader刚当选时被重置
 	if args.LeaderCommitIndex > rf.commitIndex {
 		lastIndex := uint64(len(rf.logs) - 1)
+
+		// commitIndex = min(leaderCommitIndex, len(logs)-1)
+		rf.commitIndex = lastIndex
 		if args.LeaderCommitIndex < lastIndex {
 			rf.commitIndex = args.LeaderCommitIndex
-		} else {
-			rf.commitIndex = lastIndex
 		}
 	}
 }

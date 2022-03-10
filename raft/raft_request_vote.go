@@ -30,7 +30,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	//rf.DPrintf("RPC Receive RV begin, me: %d, from: %d, term: %d", rf.me, args.CandidateID, args.Term)
+	rf.DPrintf("RPC Receive RV begin, me: %d, from: %d with term: %d", rf.me, args.CandidateID, args.Term)
 	defer func() {
 		rf.DPrintf("Receive RV, me: %d, from: %d with term: %d, voted: %v, args: %v, reply: %v", rf.me, args.CandidateID, args.Term, reply.Voted, *args, *reply)
 	}()
@@ -43,21 +43,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if args.Term > curTerm {
-		// 停止选举
-		if rf.role == raftCandidate {
-			go func() {
-				rf.votingStopChan <- struct{}{}
-			}()
-		}
-		// 停止发送AE
-		if rf.role == raftLeader {
-			go func() {
-				rf.appendEntryStopChan <- struct{}{}
-			}()
-
-		}
-
-		rf.updateTerm(args.Term)
+		rf.updateTermAndPersist(args.Term)
 		rf.switchRole(raftFollower)
 	}
 
@@ -66,11 +52,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 			reply.Voted = true
 			reply.Term = rf.term
-			// 重置定时器
-			du := rf.appendEntryTimerDuration
-			rf.appendEntryTimer.Reset(du)
-			rf.DPrintf("<RST AE Timer><%d-%s> val: %v", rf.me, rf.getRole(), du)
-			rf.updateVotedFor(int32(args.CandidateID))
+			rf.updateVotedForAndPersist(int32(args.CandidateID))
+			rf.resetTimer(applierInterval)
+			return
 		} else {
 			reply.Voted = false
 			reply.Term = rf.term
