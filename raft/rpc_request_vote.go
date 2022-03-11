@@ -56,12 +56,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.rstElectionTimer()
 			return
 		} else {
+			rf.DPrintf("Receive RV, me: %d, from: %d with term: %d, voted: false, for old log.", rf.me, args.CandidateID, args.Term)
 			reply.Voted = false
 			reply.Term = rf.term
 			return
 		}
 	} else {
 		// 本任期已投票
+		rf.DPrintf("Receive RV, me: %d, from: %d with term: %d, voted: false, for voted already.", rf.me, args.CandidateID, args.Term)
 		reply.Voted = false
 		reply.Term = rf.term
 		// 不能重置定时器

@@ -23,7 +23,7 @@ func (rf *Raft) buildAppendEntryInfoByID(who int) *appendEntryInfo {
 	defer func() {
 		// used to debug
 		if err := recover(); err != nil {
-			fmt.Println(err, who, rf.me, rf.role, preLogIndex, len(rf.logs))
+			fmt.Println(err, who, rf.me, rf.role, preLogIndex, len(rf.logs), rf.nextIndex)
 			panic(err)
 		}
 	}()

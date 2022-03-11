@@ -7,7 +7,7 @@ import (
 )
 
 func TestGetRandom(t *testing.T) {
-	base := heartbeatInterval
+	base := ElectionTimeout
 	for i := 0; i < 10; i++ {
 		for id := 0; id < 5; id++ {
 			fmt.Printf("%s-", getRandomDuration(base, id))

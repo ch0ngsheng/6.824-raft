@@ -106,7 +106,13 @@ func (rf *Raft) updateNextIndex(who int, xIndex uint64, xTerm uint64, xLen uint6
 
 func (rf *Raft) rstElectionTimer() {
 	du := getRandomDuration(ElectionTimeout, rf.me)
+	if !rf.timer.Stop() {
+		select {
+		case <-rf.timer.C:
+		default:
 
+		}
+	}
 	rf.timer.Reset(du)
 	rf.timerResetTime = time.Now()
 
@@ -115,6 +121,13 @@ func (rf *Raft) rstElectionTimer() {
 
 func (rf *Raft) rstLeaderTimer() {
 	du := HeartbeatInterval
+	if !rf.timer.Stop() {
+		select {
+		case <-rf.timer.C:
+		default:
+
+		}
+	}
 	rf.timer.Reset(du)
 	rf.timerResetTime = time.Now()
 

@@ -12,7 +12,7 @@ import (
 func getRandomDuration(base time.Duration, id int) time.Duration {
 	// rf.me作随机种子，保证每个节点种子不一样，足够随机
 	random := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
-	randomVal := random.Intn(150)
+	randomVal := random.Intn(100)
 
 	return time.Duration(randomVal)*time.Millisecond + base
 }

@@ -45,7 +45,7 @@ func candidateHandler(rf *Raft) {
 		return
 	}
 	rf.electionStopChan <- struct{}{} // 选举超时
-	rf.DPrintf("HB: <%d-%s>: (ignore)", rf.me, rf.getRole())
+	rf.DPrintf("HB: <%d-%s>: (election timeout)", rf.me, rf.getRole())
 }
 
 // followerHandler follower的心跳定时器到期
