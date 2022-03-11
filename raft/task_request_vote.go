@@ -43,12 +43,9 @@ func requestVote(rf *Raft, returnChan chan int) {
 	rf.DPrintf("HB: <%d-%s>: rise vote at new term %d, number%d", rf.me, rf.getRole(), rf.term, rf.requestVoteTimes)
 
 	resultChan := make(chan requestVoteResult, len(rf.peers)-1)
-
-	du := getRandomDuration(requestVoteTimeout, rf.me)
-	requestVoteTimer := time.NewTimer(du)
-	defer requestVoteTimer.Stop() // mark 防止.C接收错乱 todo .C没有接收会怎样？事件会一直保留吗
-
-	rf.resetTimer(heartbeatInterval)
+	rf.rstElectionTimer()
+	rf.electionStopChan = make(chan struct{}, 1)
+	electionStopChan := rf.electionStopChan
 	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {
@@ -73,7 +70,7 @@ func requestVote(rf *Raft, returnChan chan int) {
 	votedNodes := []int{rf.me}
 	denyNodes := make([]int, 0)
 
-	ticker := time.NewTicker(time.Millisecond * 50)
+	ticker := time.NewTicker(time.Millisecond * 40)
 	defer ticker.Stop()
 
 	// mark 从发出RPC，到接收到RPC响应，raft的状态可能发生了变化
@@ -84,7 +81,7 @@ func requestVote(rf *Raft, returnChan chan int) {
 		}
 
 		select {
-		case <-requestVoteTimer.C:
+		case <-electionStopChan:
 			// 选举超时
 			returnChan <- voteResultTimeout
 			return

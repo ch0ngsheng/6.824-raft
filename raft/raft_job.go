@@ -5,18 +5,16 @@ import (
 )
 
 const (
-	heartbeatInterval  = time.Millisecond * 100
-	requestVoteTimeout = time.Millisecond * 200
-	applierInterval    = time.Millisecond * 100
+	HeartbeatInterval = time.Millisecond * 50
+	ElectionTimeout   = time.Millisecond * 150
+	ApplierInterval   = time.Millisecond * 100
 )
 
 // heatbeat 监控心跳事件
 func heatbeat(rf *Raft) {
 	rf.mu.Lock()
-
 	timer := rf.timer
-	rf.resetTimer(heartbeatInterval)
-
+	rf.rstElectionTimer()
 	rf.mu.Unlock()
 
 	for {
@@ -41,11 +39,7 @@ func heatbeat(rf *Raft) {
 
 // applier 应用已提交的日志条目
 func applier(rf *Raft) {
-	rf.mu.Lock()
-	rf.DPrintf("<%d-%s>: applier start", rf.me, rf.getRole())
-	rf.mu.Unlock()
-
-	ticker := time.NewTicker(applierInterval)
+	ticker := time.NewTicker(ApplierInterval)
 	defer ticker.Stop()
 
 	for {
@@ -61,8 +55,7 @@ func applier(rf *Raft) {
 
 			lastApplied, commitIndex := rf.lastApplied, rf.commitIndex
 			rf.DPrintf("APPLY <%d-%s>: apply status: lastApplied %d, commitIndex %d", rf.me, rf.getRole(), lastApplied, commitIndex)
-			logs := make([]*raftLog, commitIndex-lastApplied)
-			copy(logs, rf.logs[lastApplied+1:commitIndex+1])
+			logs := rf.logs[lastApplied+1 : commitIndex+1]
 
 			if len(logs) == 0 {
 				rf.mu.Unlock()

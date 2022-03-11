@@ -33,14 +33,7 @@ func init() {
 
 // leaderHandler leader的心跳定时器到期
 func leaderHandler(rf *Raft) {
-	rf.mu.Lock()
-	rf.DPrintf("HB: <%d-%s>: (to append entry)", rf.me, rf.getRole())
-
-	// mark leader的心跳周期要比选举超时时间election timeout小。
-	rf.resetTimer(heartbeatInterval)
-	rf.mu.Unlock()
-
-	go appendEntry(rf)
+	appendEntry(rf)
 }
 
 // candidateHandler candidate的心跳定时器到期
@@ -48,7 +41,10 @@ func candidateHandler(rf *Raft) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.resetTimer(heartbeatInterval)
+	if rf.role != raftCandidate {
+		return
+	}
+	rf.electionStopChan <- struct{}{} // 选举超时
 	rf.DPrintf("HB: <%d-%s>: (ignore)", rf.me, rf.getRole())
 }
 
@@ -58,9 +54,9 @@ func followerHandler(rf *Raft) {
 
 	// 再次检查，是不是刚刚收到了来自leader的心跳
 	now := time.Now().Unix()
-	if rf.timerResetTime.Add(heartbeatInterval/2).Unix() > now {
+	if rf.timerResetTime.Add(HeartbeatInterval/2).Unix() > now {
 		rf.DPrintf("Ignore this timeout, because just receive HB from leader")
-		rf.resetTimer(heartbeatInterval)
+		//rf.rstElectionTimer()
 		rf.mu.Unlock()
 		return
 	}
@@ -75,7 +71,7 @@ func followerHandler(rf *Raft) {
 	resultChan := make(chan int, 0)
 	go requestVote(rf, resultChan)
 
-	ticker := time.NewTicker(time.Millisecond * 60)
+	ticker := time.NewTicker(time.Millisecond * 40)
 	var result int
 	loop := true
 	for loop {
@@ -87,7 +83,7 @@ func followerHandler(rf *Raft) {
 				rf.mu.Unlock()
 				return
 			}
-			if rf.role == raftFollower {
+			if rf.role != raftCandidate {
 				rf.mu.Unlock()
 				return
 			}
@@ -106,25 +102,25 @@ func followerHandler(rf *Raft) {
 	case voteResultFoundHigherTerm, voteResultLose:
 		rf.DPrintf("HB: <%d-%s>: vote end, be follower because of %d", rf.me, rf.getRole(), result)
 		rf.switchRole(raftFollower)
-		rf.resetTimer(heartbeatInterval)
+		// mark 选举失败，不重置定时器
 		rf.mu.Unlock()
 		return
 	case voteResultTimeout:
-		// 等待超时下次重新选举
+		// 超时重新选举
 		rf.DPrintf("HB: <%d-%s>: vote timeout at number%d, try again", rf.me, rf.getRole(), rf.requestVoteTimes)
 		rf.switchRole(raftFollower)
 		rf.mu.Unlock()
-		//mark 这里不要马上开始下一轮，而是等待当前心跳自动超时（在选举开始时和选举期间，心跳到期后都会自动重置）
-		//followerHandler(rf)
+
+		followerHandler(rf)
 		return
 	case voteResultWin:
 		rf.DPrintf("HB: <%d-%s>: vote win", rf.me, rf.getRole())
 		rf.switchRole(raftLeader)
 		// 变成leader，立即发送心跳
-		rf.resetTimer(heartbeatInterval)
 		rf.mu.Unlock()
 
-		go appendEntry(rf)
+		appendEntry(rf)
+		return
 	default:
 		rf.mu.Unlock()
 		panic(fmt.Sprintf("HB: unknown vote result %v", result))

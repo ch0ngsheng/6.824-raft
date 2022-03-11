@@ -56,9 +56,12 @@ func appendEntry(rf *Raft) {
 	rf.mu.Lock()
 
 	if !(rf.role == raftLeader) {
+		rf.DPrintf("HB: <%d-%s>: (double check, not leader anymore)")
 		rf.mu.Unlock()
 		return
 	}
+	rf.DPrintf("HB: <%d-%s>: (to append entry)", rf.me, rf.getRole())
+	rf.rstLeaderTimer()
 
 	oldTerm := rf.term
 	rf.appendEntryTimes += 1
@@ -67,7 +70,7 @@ func appendEntry(rf *Raft) {
 
 	// mark leaderCommitIndex 和 日志追加信息要在同一次加锁中获取，防止中间有更新
 	infoMap := rf.buildAppendEntryInfo()
-	peerLen, me, commitIndex := len(rf.peers), rf.me, rf.commitIndex
+	peerLen, me, commitIndex, appendEntryTimes := len(rf.peers), rf.me, rf.commitIndex, rf.appendEntryTimes
 	rf.mu.Unlock()
 
 	resultChan := make(chan *appendEntryResult, peerLen-1)
@@ -87,12 +90,16 @@ func appendEntry(rf *Raft) {
 				Entries:           infoMap[no].entries,
 				LeaderCommitIndex: commitIndex,
 			}
-			appendEntryToNode(rf, no, args, resultChan)
+			appendEntryToNode(rf, no, args, resultChan) // todo appendEntry退出后，chan的状态是什么？
 		}(i, oldTerm)
 	}
 
 	ticker := time.NewTicker(time.Millisecond * 50)
 	defer ticker.Stop()
+
+	// mark 控制goroutine数量
+	timeoutTimer := time.NewTimer(ElectionTimeout * 3)
+	defer timeoutTimer.Stop()
 
 	for {
 		if len(finishedMap) == peerLen-1 {
@@ -102,6 +109,9 @@ func appendEntry(rf *Raft) {
 
 		var result *appendEntryResult
 		select {
+		case <-timeoutTimer.C:
+			rf.DPrintf("leader: %d/ae-%dth with term %d, goroutine exit.", me, appendEntryTimes, oldTerm)
+			return
 		case <-ticker.C:
 			if rf.killed() {
 				return
@@ -135,7 +145,6 @@ func appendEntry(rf *Raft) {
 			// finishedMap[result.fromWho] = true
 			rf.DPrintf("[HB AE RESP] term: %d, leader: %d, receive old resp with term %d, IGNORE", rf.term, rf.me, result.args.Term)
 			rf.mu.Unlock()
-			//continue
 			// 交给新的goroutine处理
 			return
 		}

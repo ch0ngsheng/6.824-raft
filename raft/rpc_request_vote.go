@@ -53,7 +53,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Voted = true
 			reply.Term = rf.term
 			rf.updateVotedForAndPersist(int32(args.CandidateID))
-			rf.resetTimer(heartbeatInterval)
+			rf.rstElectionTimer()
 			return
 		} else {
 			reply.Voted = false

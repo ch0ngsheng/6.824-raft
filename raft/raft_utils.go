@@ -104,12 +104,17 @@ func (rf *Raft) updateNextIndex(who int, xIndex uint64, xTerm uint64, xLen uint6
 	rf.nextIndex[who] = xIndex
 }
 
-func (rf *Raft) resetTimer(t time.Duration) {
-	du := getRandomDuration(t, rf.me)
+func (rf *Raft) rstElectionTimer() {
+	du := getRandomDuration(ElectionTimeout, rf.me)
 
-	if rf.role == raftLeader {
-		du = du / 2
-	}
+	rf.timer.Reset(du)
+	rf.timerResetTime = time.Now()
+
+	rf.DPrintf("<RST AE Timer><%d-%s> val: %v", rf.me, rf.getRole(), du)
+}
+
+func (rf *Raft) rstLeaderTimer() {
+	du := HeartbeatInterval
 	rf.timer.Reset(du)
 	rf.timerResetTime = time.Now()
 
