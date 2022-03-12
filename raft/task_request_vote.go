@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -34,10 +35,26 @@ type sendReqVoteUtil struct {
 
 var srv = sendReqVoteUtil{}
 
-func (sendReqVoteUtil) prepareLocked(rf *Raft) (*RequestVoteArgs, chan *requestVoteResult, chan struct{}) {
+func (sendReqVoteUtil) prepareLocked(rf *Raft) (*RequestVoteArgs, chan *requestVoteResult, chan struct{}, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// 再次检查，是不是刚刚收到了来自leader的心跳
+	now := time.Now().Unix()
+	if rf.timerResetTime.Add(HeartbeatInterval/2).Unix() > now {
+		rf.DPrintf("Ignore this timeout, because just receive HB from leader")
+		return nil, nil, nil, false
+	}
+
+	// 成为candidate
+	rf.requestVoteTimes += 1
+	rf.switchRole(raftCandidate)
+	rf.updateTermAndPersist(rf.term + 1)
+	rf.updateVotedForAndPersist(int32(rf.me))
+	rf.voteCounter.Reset()
+	rf.DPrintf("HB: <%d-%s>: (to rise election) at term %d", rf.me, rf.getRole(), rf.term)
+
+	// 构造投票参数
 	lastIndex, lastTerm := rf.getLastLogNumber()
 	request := &RequestVoteArgs{
 		Term:         rf.term,
@@ -53,10 +70,10 @@ func (sendReqVoteUtil) prepareLocked(rf *Raft) (*RequestVoteArgs, chan *requestV
 	rf.electionStopChan = make(chan struct{}, 1)
 	electionStopChan := rf.electionStopChan
 
-	return request, resultChan, electionStopChan
+	return request, resultChan, electionStopChan, true
 }
 
-func (sendReqVoteUtil) sendAsync(rf *Raft, request *RequestVoteArgs, resultChan chan *requestVoteResult) {
+func (sendReqVoteUtil) ReqVoteBroadcastAsync(rf *Raft, request *RequestVoteArgs, resultChan chan *requestVoteResult) {
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -75,36 +92,53 @@ func (sendReqVoteUtil) sendAsync(rf *Raft, request *RequestVoteArgs, resultChan 
 	}
 }
 
-func (sendReqVoteUtil) checkRoleLocked(rf *Raft, returnChan chan int) bool {
+func (sendReqVoteUtil) checkRoleLocked(rf *Raft) (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if rf.killed() {
-		returnChan <- voteResultKilled
-		return false
+		return voteResultKilled, false
 	}
 
 	if rf.role != raftCandidate {
-		returnChan <- voteResultNotCandidate
-		return false
+		return voteResultNotCandidate, false
 	}
 
-	return true
+	return -1, true
 }
 
-func (sendReqVoteUtil) checkResultLocked(rf *Raft, returnChan chan int,
-	res *requestVoteResult, votedNodes, denyNodes []int) ([]int, []int, bool) {
+func (sendReqVoteUtil) countVotes(rf *Raft, res *requestVoteResult) {
+	if !res.ok {
+		// 节点响应超时
+		rf.voteCounter.Deny(res.fromWho)
+		rf.DPrintf("HB: <%d-%s>: term: %d, vote from %d, result: %s",
+			rf.me, rf.getRole(), rf.term, res.fromWho, "node not ok")
+		return
+	}
 
+	if res.reply.Voted {
+		rf.voteCounter.Vote(res.fromWho)
+		rf.DPrintf("HB: <%d-%s>: term: %d, vote resp from %d %s",
+			rf.me, rf.getRole(), rf.term, res.fromWho, "voted")
+		return
+	}
+
+	rf.voteCounter.Deny(res.fromWho)
+	rf.DPrintf("HB: <%d-%s>: term: %d, vote resp from %d %s",
+		rf.me, rf.getRole(), rf.term, res.fromWho, "deny")
+}
+
+func (sendReqVoteUtil) checkPeerRespLocked(rf *Raft,
+	res *requestVoteResult) (int, bool) {
+
+	if rf.killed() {
+		return voteResultKilled, false
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.killed() {
-		returnChan <- voteResultKilled
-		return votedNodes, denyNodes, false
-	}
 	if rf.role != raftCandidate {
-		returnChan <- voteResultNotCandidate
-		return votedNodes, denyNodes, false
+		return voteResultNotCandidate, false
 	}
 
 	if res.args.Term < rf.term {
@@ -112,87 +146,100 @@ func (sendReqVoteUtil) checkResultLocked(rf *Raft, returnChan chan int,
 		rf.DPrintf("HB: <%d-%s>: term %d, receive old RV resp from %d with old term %d, ignore",
 			rf.me, rf.getRole(), rf.term, res.fromWho, res.args.Term)
 		// 收到老term的消息，说明这个协程已经是老的了，直接退出
-		returnChan <- voteResultOutdated
-		return votedNodes, denyNodes, false
+		return voteResultOutdated, false
 	}
 
-	if !res.ok {
-		// 节点响应超时
-		denyNodes = append(denyNodes, res.fromWho)
-		rf.DPrintf("HB: <%d-%s>: term: %d, vote from %d, result: %s",
-			rf.me, rf.getRole(), rf.term, res.fromWho, "node not ok")
-	} else {
-		if res.reply.Term > atomic.LoadUint64(&rf.term) {
-			rf.DPrintf("HB: <%d-%s>: term: %d, vote quit because higher term %d",
-				rf.me, rf.getRole(), rf.term, res.reply.Term)
+	if res.ok && res.reply.Term > atomic.LoadUint64(&rf.term) {
+		rf.DPrintf("HB: <%d-%s>: term: %d, vote quit because higher term %d",
+			rf.me, rf.getRole(), rf.term, res.reply.Term)
 
-			rf.updateTermAndPersist(res.reply.Term) // mark 收到高term响应
-			returnChan <- voteResultFoundHigherTerm
-			return votedNodes, denyNodes, false
-		}
-		if res.reply.Voted {
-			votedNodes = append(votedNodes, res.fromWho)
-			rf.DPrintf("HB: <%d-%s>: term: %d, vote resp from %d %s",
-				rf.me, rf.getRole(), rf.term, res.fromWho, "voted")
-		} else {
-			denyNodes = append(denyNodes, res.fromWho)
-			rf.DPrintf("HB: <%d-%s>: term: %d, vote resp from %d %s",
-				rf.me, rf.getRole(), rf.term, res.fromWho, "deny")
-		}
+		rf.updateTermAndPersist(res.reply.Term)
+		// 对方在高任期
+		return voteResultFoundHigherTerm, false
 	}
 
-	if len(votedNodes) > len(rf.peers)/2 {
-		// 当选
+	// 计票
+	srv.countVotes(rf, res)
+
+	if rf.voteCounter.VoteNum() > len(rf.peers)/2 {
 		rf.DPrintf("HB: <%d-%s>: term: %d, voted: %v, deny: %v result: %s",
-			rf.me, rf.getRole(), rf.term, votedNodes, denyNodes, "win!")
-		returnChan <- voteResultWin
-		return votedNodes, denyNodes, false
+			rf.me, rf.getRole(), rf.term, rf.voteCounter.Voted(), rf.voteCounter.Denied(), "win!")
+		return voteResultWin, false
 	}
-	if len(denyNodes) > len(rf.peers)/2 {
-		// 未当选
+	if rf.voteCounter.DenyNum() > len(rf.peers)/2 {
 		rf.DPrintf("HB: <%d-%s>: term: %d, voted: %v, deny: %v result: %s",
-			rf.me, rf.getRole(), rf.term, votedNodes, denyNodes, "lose!")
-		returnChan <- voteResultLose
-		return votedNodes, denyNodes, false
+			rf.me, rf.getRole(), rf.term, rf.voteCounter.Voted(), rf.voteCounter.Denied(), "lose!")
+		return voteResultLose, false
 	}
 
 	// 继续等待
-	return votedNodes, denyNodes, true
+	return -1, true
+}
+
+func (sendReqVoteUtil) handleVoteResultLocked(rf *Raft, result int) heartbeatHandler {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	switch result {
+	case voteResultKilled, voteResultNotCandidate, voteResultOutdated:
+		return nil
+	case voteResultFoundHigherTerm, voteResultLose:
+		// mark 选举失败，不重置定时器
+		rf.DPrintf("HB: <%d-%s>: vote end, be follower because of %d", rf.me, rf.getRole(), result)
+		rf.switchRole(raftFollower)
+		return nil
+	case voteResultTimeout:
+		// 超时重新选举
+		rf.DPrintf("HB: <%d-%s>: vote timeout at number %d, try again", rf.me, rf.getRole(), rf.requestVoteTimes)
+		rf.switchRole(raftFollower)
+
+		return followerHandler
+	case voteResultWin:
+		// 变成leader，立即发送心跳
+		rf.DPrintf("HB: <%d-%s>: vote win", rf.me, rf.getRole())
+		rf.switchRole(raftLeader)
+
+		return leaderHandler
+	default:
+		panic(fmt.Sprintf("HB: unknown vote result %v", result))
+	}
 }
 
 // requestVote 发起投票，follower在心跳超时时执行
-func requestVote(rf *Raft, returnChan chan int) {
-	request, resultChan, electionStopChan := srv.prepareLocked(rf)
+func requestVote(rf *Raft) {
+	request, peerRespChan, electionStopChan, ok := srv.prepareLocked(rf)
+	if !ok {
+		return
+	}
 
-	srv.sendAsync(rf, request, resultChan)
-
-	votedNodes := []int{rf.me}
-	var denyNodes []int
-	var goon bool
+	// 发出投票请求
+	srv.ReqVoteBroadcastAsync(rf, request, peerRespChan)
 
 	ticker := time.NewTicker(time.Millisecond * 40)
 	defer ticker.Stop()
 
+	var goon = true
+	var voteResult int
+
 	// mark 从发出RPC，到接收到RPC响应，raft的状态可能发生了变化
-	for {
-		if ok := srv.checkRoleLocked(rf, returnChan); !ok {
-			return
+	for goon {
+		if voteResult, goon = srv.checkRoleLocked(rf); !goon {
+			break
 		}
 
 		select {
 		case <-electionStopChan:
 			// 选举超时
-			returnChan <- voteResultTimeout
-			return
+			voteResult = voteResultTimeout
+			goon = false
 		case <-ticker.C:
-			if ok := srv.checkRoleLocked(rf, returnChan); !ok {
-				return
-			}
-		case res := <-resultChan:
-			votedNodes, denyNodes, goon = srv.checkResultLocked(rf, returnChan, res, votedNodes, denyNodes)
-			if !goon {
-				return
-			}
+			voteResult, goon = srv.checkRoleLocked(rf)
+		case resp := <-peerRespChan:
+			voteResult, goon = srv.checkPeerRespLocked(rf, resp)
 		}
+	}
+
+	if handler := srv.handleVoteResultLocked(rf, voteResult); handler != nil {
+		handler(rf)
 	}
 }

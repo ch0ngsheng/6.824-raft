@@ -13,7 +13,7 @@ echo "loops: $i/$total" >> $file.shout
 
 go test -race -run $test &> $file
 if [[ $? -ne 0 ]]; then
-  echo "Error, check file $file for details." && exit 1
+  echo "Error, check file $file for details." >> $file.shout && exit 1
 fi
 echo "Success" >> $file.shout
 

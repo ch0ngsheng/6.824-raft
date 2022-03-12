@@ -70,6 +70,7 @@ type Raft struct {
 	timer            *time.Timer   // 选举定时器
 	timerResetTime   time.Time     // 选举定时器重置时间
 	electionStopChan chan struct{} // 选举超时停止信号
+	voteCounter      *VoteCounter  // 选举计票器
 
 	// 持久化字段
 	term     uint64     // 当前任期
@@ -293,6 +294,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.timer = time.NewTimer(getRandomDuration(ElectionTimeout, rf.me))
 	rf.timer.Stop()
 	rf.electionStopChan = make(chan struct{}, 1)
+	rf.voteCounter = NewVoteCounter(rf.me)
 
 	rf.logs = []*raftLog{{0, 0}} // log索引从1开始
 	rf.logTermsFirst = map[uint64]uint64{0: 0}
