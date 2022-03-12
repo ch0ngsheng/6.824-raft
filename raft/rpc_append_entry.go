@@ -1,5 +1,6 @@
 package raft
 
+// AppendEntryArgs AppendEntry RPC 的请求参数
 type AppendEntryArgs struct {
 	Term              uint64
 	LeaderID          int
@@ -9,6 +10,7 @@ type AppendEntryArgs struct {
 	LeaderCommitIndex uint64
 }
 
+// AppendEntryReply AppendEntry RPC 的响应参数
 type AppendEntryReply struct {
 	Term    uint64
 	Success bool
@@ -17,7 +19,12 @@ type AppendEntryReply struct {
 	XTerm  uint64
 	XLen   uint64
 }
+type appEntryUtil struct {
+}
 
+var ae = appEntryUtil{}
+
+// AppendEntry 处理Append Entry RPC
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -31,26 +38,43 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		)
 	}()
 
-	if args.Term < rf.term {
-		reply.Success = false
-		reply.Term = rf.term
+	if ok := ae.checkTerm(rf, args, reply); !ok {
 		return
 	}
 
 	rf.rstElectionTimer()
+	ae.updateTermAndRole(rf, args.Term)
 
-	if rf.role != raftFollower {
-		rf.switchRole(raftFollower)
+	if can := ae.canAppend(rf, args, reply); !can {
+		return
 	}
 
-	if args.Term > rf.term {
-		rf.switchRole(raftFollower)
-		rf.updateTermAndPersist(args.Term)
-	}
+	ae.appendLog(rf, args, reply)
+}
 
+func (appEntryUtil) checkTerm(rf *Raft, args *AppendEntryArgs, reply *AppendEntryReply) bool {
+	if args.Term < rf.term {
+		reply.Success = false
+		reply.Term = rf.term
+		return false
+	}
+	return true
+}
+
+func (appEntryUtil) updateTermAndRole(rf *Raft, term uint64) {
+	rf.switchRole(raftFollower)
+
+	if term > rf.term {
+		rf.updateTermAndPersist(term)
+	}
+}
+
+func (appEntryUtil) canAppend(rf *Raft, args *AppendEntryArgs, reply *AppendEntryReply) (can bool) {
 	if args.PreLogIndex == 0 {
 		// 从第1个日志开始发送的
-	} else if uint64(len(rf.logs)-1) < args.PreLogIndex {
+		return true
+	}
+	if uint64(len(rf.logs)-1) < args.PreLogIndex {
 		// 自己的日志短
 		reply.Success = false
 		reply.Term = rf.term
@@ -58,8 +82,9 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.XIndex = 0
 		reply.XLen = uint64(len(rf.logs))
 
-		return
-	} else if rf.logs[args.PreLogIndex].Term != args.PreLogTerm {
+		return false
+	}
+	if rf.logs[args.PreLogIndex].Term != args.PreLogTerm {
 		// preLogIndex处的日志term不匹配
 		reply.Success = false
 		reply.Term = rf.term
@@ -67,16 +92,19 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.XIndex = rf.logTermsFirst[reply.XTerm]
 		reply.XLen = 0
 
-		return
+		return false
 	}
+	return true
+}
 
+func (appEntryUtil) appendLog(rf *Raft, args *AppendEntryArgs, reply *AppendEntryReply) {
 	reply.Term = rf.term
 	reply.Success = true
 
 	// 追加日志
-	newLogs := rf.logs[:args.PreLogIndex+1]
-	newLogs = append(newLogs, args.Entries...)
-	rf.logs = newLogs
+	newLogs := make([]*raftLog, len(args.Entries))
+	copy(newLogs, args.Entries)
+	rf.logs = append(rf.logs[:args.PreLogIndex+1], newLogs...)
 
 	// 更新logTermsFirst, logTermsLast
 	for i := args.PreLogIndex + 1; i < uint64(len(rf.logs)); i++ {

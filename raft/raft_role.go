@@ -68,7 +68,7 @@ func followerHandler(rf *Raft) {
 	rf.DPrintf("HB: <%d-%s>: (to rise election) at term %d", rf.me, rf.getRole(), rf.term)
 	rf.mu.Unlock()
 
-	resultChan := make(chan int, 0)
+	resultChan := make(chan int, 1)
 	go requestVote(rf, resultChan)
 
 	ticker := time.NewTicker(time.Millisecond * 40)
@@ -107,7 +107,7 @@ func followerHandler(rf *Raft) {
 		return
 	case voteResultTimeout:
 		// 超时重新选举
-		rf.DPrintf("HB: <%d-%s>: vote timeout at number%d, try again", rf.me, rf.getRole(), rf.requestVoteTimes)
+		rf.DPrintf("HB: <%d-%s>: vote timeout at number %d, try again", rf.me, rf.getRole(), rf.requestVoteTimes)
 		rf.switchRole(raftFollower)
 		rf.mu.Unlock()
 

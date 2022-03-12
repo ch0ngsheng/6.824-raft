@@ -309,7 +309,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.matchIndex[i] = 0
 	}
 
-	go heatbeat(rf) // 心跳检测
+	go heartbeat(rf) // 心跳检测
 
 	go applier(rf) // 日志应用
 
