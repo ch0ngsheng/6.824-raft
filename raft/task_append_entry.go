@@ -60,7 +60,12 @@ func (sendEntryUtil) prepareLocked(rf *Raft) (chan *appendEntryResult, uint64, u
 	rf.mu.Lock()
 
 	if rf.role != raftLeader {
-		rf.DPrintf("HB: <%d-%s>: (double check, not leader anymore)")
+		rf.DPrintf("HB: <%d-%s>: (double check, not leader anymore)", rf.me, rf.getRole())
+		// 有两种原因导致这种情况
+		// 1. leader刚收到了高任期AppendEntry，刚刚变为follower（会重置定时器）
+		// 2. leader刚收到了高任期RequestVote，刚刚变为follower，可能刚重置了定时器（投出票），也可能没有重置（没投票）
+		// 为了防止出现该节点再无定时器触发的情况，这里要重置一次定时器
+		rf.rstElectionTimer()
 		rf.mu.Unlock()
 		return nil, 0, 0, 0, 0, false
 	}
