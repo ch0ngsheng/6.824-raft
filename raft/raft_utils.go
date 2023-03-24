@@ -74,25 +74,6 @@ func (rf *Raft) switchToLeaderAndPersist() {
 	}
 	rf.matchIndex[rf.me] = uint64(len(rf.logs) - 1)
 
-	// 重置logTermsFirst, LastIndexPerTerm
-	rf.FirstIndexPerTerm = make(map[TermType]uint64)
-	rf.LastIndexPerTerm = make(map[TermType]uint64)
-
-	// 重置 totalNoOP
-	rf.totalNoOPLogs = 0
-
-	for i := 0; i < len(rf.logs); i++ {
-		log := rf.logs[i]
-		if _, ok := rf.FirstIndexPerTerm[log.Term]; !ok {
-			rf.FirstIndexPerTerm[log.Term] = uint64(i)
-		}
-		rf.LastIndexPerTerm[log.Term] = uint64(i)
-
-		if log.NoOp {
-			rf.totalNoOPLogs += 1
-		}
-	}
-
 	rf.persist()
 }
 

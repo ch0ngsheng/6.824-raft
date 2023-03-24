@@ -15,9 +15,9 @@ type AppendEntryReply struct {
 	Term    TermType
 	Success bool
 	// 冲突回退参数
-	XIndex uint64
-	XTerm  TermType
-	XLen   uint64
+	XTerm  TermType // Follower节点PreLogIndex位置的实际任期号
+	XIndex uint64   // XTerm任期的开始索引
+	XLen   uint64   // Follower的日志长度，当Follower的日志长度小于PreLogIndex时回复
 }
 type AppendEntryUtil struct {
 }
@@ -94,10 +94,38 @@ func (AppendEntryUtil) appendLog(rf *Raft, args *AppendEntryArgs, reply *AppendE
 	reply.Term = rf.term
 	reply.Success = true
 
+	for i := int(args.PreLogIndex) + 1; i < len(rf.logs); i++ {
+		// 处理要清理的日志
+		log := rf.logs[i]
+		if _, ok := rf.FirstIndexPerTerm[log.Term]; ok {
+			delete(rf.FirstIndexPerTerm, log.Term)
+		}
+		if _, ok := rf.LastIndexPerTerm[log.Term]; ok {
+			delete(rf.LastIndexPerTerm, log.Term)
+		}
+		
+		if log.NoOp {
+			rf.totalNoOPLogs -= 1
+		}
+	}
+
 	// 追加日志
 	newLogs := make([]*Log, len(args.Entries))
 	copy(newLogs, args.Entries)
 	rf.logs = append(rf.logs[:args.PreLogIndex+1], newLogs...)
+
+	// 更新logTermsFirst, logTermsLast，用于日志和Leader不匹配时的快速回退
+	for i := args.PreLogIndex + 1; i < uint64(len(rf.logs)); i++ {
+		log := rf.logs[i]
+		if _, ok := rf.FirstIndexPerTerm[log.Term]; !ok {
+			rf.FirstIndexPerTerm[log.Term] = i
+		}
+		rf.LastIndexPerTerm[log.Term] = i
+
+		if log.NoOp {
+			rf.totalNoOPLogs += 1
+		}
+	}
 
 	rf.persist()
 
