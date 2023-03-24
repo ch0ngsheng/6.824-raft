@@ -1,70 +1,44 @@
 package raft
 
 import (
-	"sync/atomic"
 	"time"
 )
 
 // getLastLogNumber 获取最后一条日志条目，返回索引号，任期号
-func (rf *Raft) getLastLogNumber() (index uint64, term uint64) {
+func (rf *Raft) getLastLogNumber() (index uint64, term TermType) {
 	lens := uint64(len(rf.logs))
 	return lens - 1, rf.logs[lens-1].Term
 }
 
-func (rf *Raft) getRole() string {
-	role := atomic.LoadUint32(&rf.role)
-	return roleMap[role]
-}
-
-func (rf *Raft) switchRole(role uint32) {
-	rf.role = role
-
-	if role == raftLeader {
-		rf.nextIndex = make([]uint64, len(rf.peers))
-		rf.matchIndex = make([]uint64, len(rf.peers))
-		for i := 0; i < len(rf.peers); i++ {
-			rf.nextIndex[i] = uint64(len(rf.logs)) // 初始值为leader最后一个日志条目的索引值+1
-			rf.matchIndex[i] = 0
-		}
-		rf.matchIndex[rf.me] = uint64(len(rf.logs) - 1)
-
-		// 重置logTermsFirst, logTermsLast
-		rf.logTermsFirst = make(map[uint64]uint64)
-		rf.logTermsLast = make(map[uint64]uint64)
-		for i := 0; i < len(rf.logs); i++ {
-			log := rf.logs[i]
-			if _, ok := rf.logTermsFirst[log.Term]; !ok {
-				rf.logTermsFirst[log.Term] = uint64(i)
-			}
-			rf.logTermsLast[log.Term] = uint64(i)
-		}
-
-		rf.persist()
-	}
+func (rf *Raft) switchToCandidateAndPersist() {
+	rf.requestVoteTimes += 1
+	rf.votedFor = int32(rf.me)
+	rf.term += 1
+	rf.role = Candidate
+	rf.persist()
+	rf.voteCounter.Reset()
 }
 
 func (rf *Raft) updateMatchIndex(who int, matchIndex uint64) {
 	rf.matchIndex[who] = matchIndex
-	rf.nextIndex[who] = matchIndex + 1
+	rf.nextAppendEntryIndex[who] = matchIndex + 1
 }
 
 func (rf *Raft) updateCommitIndex() {
 	/*
-		Fig.8的要求，只通过当前term的日志判断是否更新commitIndex
+		论文Fig.8的要求，只通过当前term的日志判断是否更新commitIndex
 			If there exists an N such that
 				N > commitIndex,
 				a majority of matchIndex[i] ≥ N,
 				and log[N].term == currentTerm:
 			set commitIndex = N
 
-		实际实现时做了扩展：
-			如果全部节点都满足 matchIndex[i] >= N，set commitIndex = N
-			此时不要求log[N].Term == currentTerm
+		论文中还提到，刚切换为Leader时写入当前term下的一条no-op日志，解决没有客户端请求进来时，无法推进commitIndex的问题
 	*/
 	for i := rf.commitIndex + 1; i < uint64(len(rf.logs)); i++ {
-		/*if rf.logs[i].Term != rf.term {
+		if rf.logs[i].Term != rf.term {
 			continue
-		}*/
+		}
 
 		var cnt int
 		for j := 0; j < len(rf.peers); j++ {
@@ -74,62 +48,100 @@ func (rf *Raft) updateCommitIndex() {
 		}
 		if rf.logs[i].Term == rf.term && cnt > len(rf.peers)/2 {
 			rf.commitIndex = i
-		} else if rf.logs[i].Term != rf.term && cnt == len(rf.peers) {
-			rf.commitIndex = i
-			rf.DPrintf("ALL MATCH, update commitIndex from earlier term %d", rf.logs[i].Term)
 		}
 	}
 }
 
-func (rf *Raft) updateTermAndPersist(term uint64) {
-	rf.term = term
+func (rf *Raft) switchToLeaderAndPersist() {
+	rf.role = Leader
 	rf.votedFor = -1
+
+	// 发送一次心跳No-OP
+	log := &Log{
+		Term:    rf.term,
+		Command: -1,
+		NoOp:    true,
+	}
+	rf.WriteLog(log)
+	go appendEntry(rf)
+
+	// 初始化
+	rf.nextAppendEntryIndex = make([]uint64, len(rf.peers))
+	rf.matchIndex = make([]uint64, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.nextAppendEntryIndex[i] = uint64(len(rf.logs)) // 初始值为leader最后一个日志条目的索引值+1
+		rf.matchIndex[i] = 0
+	}
+	rf.matchIndex[rf.me] = uint64(len(rf.logs) - 1)
+
+	// 重置logTermsFirst, LastIndexPerTerm
+	rf.FirstIndexPerTerm = make(map[TermType]uint64)
+	rf.LastIndexPerTerm = make(map[TermType]uint64)
+
+	// 重置 totalNoOP
+	rf.totalNoOPLogs = 0
+
+	for i := 0; i < len(rf.logs); i++ {
+		log := rf.logs[i]
+		if _, ok := rf.FirstIndexPerTerm[log.Term]; !ok {
+			rf.FirstIndexPerTerm[log.Term] = uint64(i)
+		}
+		rf.LastIndexPerTerm[log.Term] = uint64(i)
+
+		if log.NoOp {
+			rf.totalNoOPLogs += 1
+		}
+	}
 
 	rf.persist()
 }
+
+func (rf *Raft) switchToFollowerAndPersist(term TermType) {
+	rf.role = Follower
+	rf.term = term
+	rf.votedFor = -1
+	rf.persist()
+}
+
 func (rf *Raft) updateVotedForAndPersist(id int32) {
 	rf.votedFor = id
 	rf.persist()
 }
 
-func (rf *Raft) updateNextIndex(who int, xIndex uint64, xTerm uint64, xLen uint64) {
+func (rf *Raft) updateNextIndex(who int, xIndex uint64, xTerm TermType, xLen uint64) {
 	if xLen != 0 {
-		rf.nextIndex[who] = xLen
+		rf.nextAppendEntryIndex[who] = xLen
 		return
 	}
-	if idx, ok := rf.logTermsLast[xTerm]; ok {
-		rf.nextIndex[who] = idx + 1
+	if idx, ok := rf.LastIndexPerTerm[xTerm]; ok {
+		rf.nextAppendEntryIndex[who] = idx + 1
 		return
 	}
-	rf.nextIndex[who] = xIndex
+	rf.nextAppendEntryIndex[who] = xIndex
 }
 
-func (rf *Raft) rstElectionTimer() {
-	du := getRandomDuration(ElectionTimeout, rf.me)
-	if !rf.timer.Stop() {
-		select {
-		case <-rf.timer.C:
-		default:
-
-		}
-	}
-	rf.timer.Reset(du)
-	rf.timerResetTime = time.Now()
-
-	rf.DPrintf("<RST AE Timer><%d-%s> val: %v", rf.me, rf.getRole(), du)
+// resetElectionTimer 重置选举超时时间
+func (rf *Raft) resetElectionTimer() {
+	du := GetRandomDuration(ElectionTimeout, rf.me)
+	rf.resetTimer(du)
 }
 
-func (rf *Raft) rstLeaderTimer() {
+// resetLeaderTimer 重置Leader发送心跳时间
+func (rf *Raft) resetLeaderTimer() {
 	du := HeartbeatInterval
-	if !rf.timer.Stop() {
+	rf.resetTimer(du)
+}
+
+func (rf *Raft) resetTimer(du time.Duration) {
+	if !rf.electionTimer.Stop() { // mark 此时，raft_job.go 中正在 <-electionTimer.C 阻塞
 		select {
-		case <-rf.timer.C:
+		case <-rf.electionTimer.C:
 		default:
 
 		}
 	}
-	rf.timer.Reset(du)
+	rf.electionTimer.Reset(du)
 	rf.timerResetTime = time.Now()
 
-	rf.DPrintf("<RST AE Timer><%d-%s> val: %v", rf.me, rf.getRole(), du)
+	DPrintf("<RST AE Timer><%d-%s> val: %v, %s", rf.me, rf.role, du, rf.timerResetTime.Format(time.RFC3339Nano))
 }

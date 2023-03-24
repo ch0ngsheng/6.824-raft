@@ -1,49 +1,69 @@
 # 6.824-raft
+## 介绍
 
-## 问题一
-[此时，0的日志长度为]
-怀疑原因：panic的是一个leader L
-把某个节点A的日志追加到918，并设置nextLogIndex[A] = 919
-L的日志由另一个leader，回滚到415长度（此时应是follower，应停止发送AE）
-L(可能又成为leader)给A发送AE RPC，根据nextLogIndex计算的preLogIndex为918，越界
+## 实现细节
+1. 在Candidate发出投票RPC或Leader发出心跳RPC后，等待响应的过程中，要检查自己是否还是Candidate/Leader状态。
+   * 如果不再是Candidate/Leader，应该停止等待响应
+   * 这种情况发生在收到其他高任期节点的消息后，变为Follower时
+   * 类似的，在发出RPC或者重试RPC前，也要先确认自己的身份
 
-处理方法：
-变为follower时，停止发送AE；
-发送或者重试AE RPC前，判断自己是否还是leader
+2. 不要过早优化，直接使用sync.Mutex上大锁即可
+   * 不要在一开始就考虑怎么使用atomic包减小锁争用
 
-panic: runtime error: index out of range [918] with length 415
+3. 需要实现一种论文中提到的快速匹配Follower日志进度的方法
+   * 集群网络不稳定时，部分Follower的日志和Leader差异较大，Leader需要快速匹配到每个Follower的日志进度
 
-goroutine 15004 [running]:
-6.824-raft/raft.(*Raft).buildAppendEntryInfoByID(...)
-/Users/chongshengyu/Code/etcd/6.824-raft/raft/raft_append_entry.go:29
-6.824-raft/raft.appendEntry(0xc000126460)
-/Users/chongshengyu/Code/etcd/6.824-raft/raft/raft_job.go:266 +0xb25
-created by 6.824-raft/raft.followerHandler
-/Users/chongshengyu/Code/etcd/6.824-raft/raft/raft_role.go:79 +0x5cf
-exit status 2
-FAIL	6.824-raft/raft	35.523s
+4. 需要实现论文中提到的No-OP日志
+   * 成为Leader后，需要向日志中追加当前任期的No-OP日志
+   * 防止因客户端无写入请求导致低任期的日志无法提交，进而无法应用到状态机
+   * 因为根据`安全性`要求，Leader只能提交自己任期的日志
 
-## 还是有问题
+## 测试结果
+```shell
+Test (2A): initial election ...
+  ... Passed --   3.0  3  120   33022    0
+Test (2A): election after network failure ...
+  ... Passed --   4.5  3  268   54316    0
+PASS
+ok  	6.824-raft/raft	7.988s
+
+Test (2B): basic agreement ...
+  ... Passed --   0.6  3   26    6826    3
+Test (2B): RPC byte count ...
+  ... Passed --   1.4  3   58  116454   11
+Test (2B): agreement despite follower disconnection ...
+  ... Passed --   3.7  3  174   43092    7
+Test (2B): no agreement if too many followers disconnect ...
+  ... Passed --   3.4  5  410   83336    3
+Test (2B): concurrent Start()s ...
+  ... Passed --   0.6  3   26    7194    6
+Test (2B): rejoin of partitioned leader ...
+  ... Passed --   4.1  3  297   67898    4
+Test (2B): leader backs up quickly over incorrect follower logs ...
+  ... Passed --  16.6  5 2909 2162131  102
+Test (2B): RPC counts aren't too high ...
+  ... Passed --   2.2  3   90   25274   12
+PASS
+ok  	6.824-raft/raft	32.952s
+
+
+Test (2C): basic persistence ...
+labgob warning: Decoding into a non-default variable/field int32 may not work
+  ... Passed --   3.3  3  161   41705    6
+Test (2C): more persistence ...
+  ... Passed --  15.2  5 1725  362817   16
+Test (2C): partitioned leader and one follower crash, leader restarts ...
+  ... Passed --   1.5  3   65   16396    4
+Test (2C): Figure 8 ...
+  ... Passed --  36.6  5 3047  702232   54
+Test (2C): unreliable agreement ...
+  ... Passed --   5.2  5  415  126281  246
 Test (2C): Figure 8 (unreliable) ...
-runtime error: index out of range [300] with length 280 1 3 1 300 280
-panic: runtime error: index out of range [300] with length 280 [recovered]
-panic: runtime error: index out of range [300] with length 280
-
-goroutine 58870 [running]:
-6.824-raft/raft.(*Raft).buildAppendEntryInfoByID.func1()
-/Users/chongshengyu/Code/etcd/6.824-raft/raft/raft_append_entry.go:36 +0x1fe
-panic({0x1261560, 0xc00001fe00})
-/Users/chongshengyu/.g/go/src/runtime/panic.go:1047 +0x266
-6.824-raft/raft.(*Raft).buildAppendEntryInfoByID(0xc0002a8b60, 0x1)
-/Users/chongshengyu/Code/etcd/6.824-raft/raft/raft_append_entry.go:40 +0x396
-6.824-raft/raft.appendEntry(0xc0002a8b60)
-/Users/chongshengyu/Code/etcd/6.824-raft/raft/raft_job.go:311 +0xc7e
-6.824-raft/raft.followerHandler.func1(0x0)
-/Users/chongshengyu/Code/etcd/6.824-raft/raft/raft_role.go:95 +0x2f
-created by 6.824-raft/raft.followerHandler
-/Users/chongshengyu/Code/etcd/6.824-raft/raft/raft_role.go:94 +0xada
-
-## 问题二
-
-Fig8. unreliable的测试 达不成一致性：
-L0收到C3回复的更高的term号，L0应立即变为follower，停止AE。
+  ... Passed --  35.3  5 6981 11407610   98
+Test (2C): churn ...
+  ... Passed --  16.2  5 2004 1021379   85
+Test (2C): unreliable churn ...
+  ... Passed --  16.3  5 1419  426589  289
+PASS
+ok  	6.824-raft/raft	129.868s
+```

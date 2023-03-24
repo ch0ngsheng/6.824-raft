@@ -7,26 +7,27 @@ import (
 // heartbeat 监控心跳事件
 func heartbeat(rf *Raft) {
 	rf.mu.Lock()
-	timer := rf.timer
-	rf.rstElectionTimer()
+	rf.resetElectionTimer()
 	rf.mu.Unlock()
 
 	for {
 		select {
-		case <-timer.C:
-			// 角色可能发生了变化
-			rf.mu.Lock()
+		case <-rf.stopCh:
+			return
+		case <-rf.electionTimer.C:
+			func() {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
 
-			if rf.killed() {
-				rf.DPrintf("<%d-%s>: find killed when heartbeat %p", rf.me, rf.getRole(), rf)
-				rf.mu.Unlock()
-				return
-			}
+				// 角色可能发生了变化
+				if rf.killed() {
+					DPrintf("<%d-%s>: find killed when heartbeat.", rf.me, rf.role)
+					return
+				}
 
-			handler := heartbeatHandlerMap[rf.role]
-			rf.mu.Unlock()
-
-			go handler(rf)
+				DPrintf("<%d-%s>: election-timer-reset %s", rf.me, rf.role, time.Now().Format(time.RFC3339Nano))
+				go heartbeatHandlerMap[rf.role](rf)
+			}()
 		}
 	}
 }
@@ -38,45 +39,47 @@ func applier(rf *Raft) {
 
 	for {
 		select {
+		case <-rf.stopCh:
+			return
 		case <-ticker.C:
-			rf.mu.Lock()
-
-			exit := applyLog(rf)
-			if exit {
+			if rf.killed() {
+				rf.mu.Lock()
+				DPrintf("<%d-%s>: applier exit because node is killed.", rf.me, rf.role)
 				rf.mu.Unlock()
 				return
 			}
 
-			rf.mu.Unlock()
+			applyLogBatchLocked(rf)
 		}
 	}
 }
 
-func applyLog(rf *Raft) (exit bool) {
-	if rf.killed() {
-		rf.DPrintf("<%d-%s>: applier exit because node is killed %p", rf.me, rf.getRole(), rf)
-		return true
-	}
+func applyLogBatchLocked(rf *Raft) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	lastApplied, commitIndex := rf.lastApplied, rf.commitIndex
-	rf.DPrintf("APPLY <%d-%s>: apply status: lastApplied %d, commitIndex %d", rf.me, rf.getRole(), lastApplied, commitIndex)
-	logs := rf.logs[lastApplied+1 : commitIndex+1]
+	DPrintf("APPLY <%d-%s>: apply status: lastAppliedIndex %d, commitIndex %d",
+		rf.me, rf.role, rf.lastAppliedIndex, rf.commitIndex)
 
+	logs := rf.logs[rf.lastAppliedIndex+1 : rf.commitIndex+1]
 	if len(logs) == 0 {
-		return false
+		return
 	}
 
-	rf.DPrintf("<%d-%s>: applying %d logs", rf.me, rf.getRole(), len(logs))
+	DPrintf("<%d-%s>: applying %d logs", rf.me, rf.role, len(logs))
 
 	for i := 0; i < len(logs); i++ {
-		idx := int(lastApplied+1) + i
+		if logs[i].NoOp {
+			continue
+		}
 		msg := ApplyMsg{
 			CommandValid: true,
-			Command:      logs[i].Entry,
-			CommandIndex: idx,
+			Command:      logs[i].Command,
+			CommandIndex: int(rf.lastAppliedOPIndex) + 1,
 		}
 		rf.applyMsgChan <- msg
-		rf.lastApplied = uint64(idx)
+		rf.lastAppliedOPIndex += 1
 	}
-	return false
+
+	rf.lastAppliedIndex += uint64(len(logs))
 }

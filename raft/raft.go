@@ -19,6 +19,8 @@ package raft
 
 import (
 	"bytes"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,10 +29,6 @@ import (
 	"6.824-raft/labrpc"
 )
 
-// import "bytes"
-// import "../labgob"
-
-//
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -40,21 +38,42 @@ import (
 // in Lab 3 you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
-//
+
+// ApplyMsg 向状态机应用的一条日志命令
 type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
+	CommandValid bool        // 是否合法
+	Command      interface{} // 命令信息，测试框架中使用int类型
+	CommandIndex int         // 命令索引
 }
 
-type raftLog struct {
-	Term  uint64
-	Entry interface{}
+type TermType uint32
+
+// Log 日志条目
+type Log struct {
+	Term    TermType    // 任期
+	Command interface{} // 命令
+	NoOp    bool        // 是否是NO-OP日志
 }
 
-//
-// A Go object implementing a single Raft peer.
-//
+// Logs 日志列表，用于调试输出
+type Logs []*Log
+
+func (logs Logs) String() string {
+	sb := strings.Builder{}
+	for _, log := range logs {
+		var command string
+		switch log.Command.(type) {
+		case string:
+			command = log.Command.(string)
+		case int:
+			command = fmt.Sprintf("%d", log.Command.(int))
+		}
+		sb.WriteString(fmt.Sprintf("%d-%s,", log.Term, command)) // 测试框架中Command为int类型
+	}
+	return sb.String()
+}
+
+// Raft A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -62,30 +81,35 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
+	stopCh chan struct{}
+
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	role uint32 // 当前角色
 
-	timer            *time.Timer   // 选举定时器
-	timerResetTime   time.Time     // 选举定时器重置时间
-	electionStopChan chan struct{} // 选举超时停止信号
-	voteCounter      *VoteCounter  // 选举计票器
+	electionTimer         *time.Timer   // 选举定时器
+	timerResetTime        time.Time     // 选举定时器重置时间
+	electionTimeoutSignal chan struct{} // 选举超时信号
+	voteCounter           *VoteCounter  // 选举计票器，candidate计票用
 
 	// 持久化字段
-	term     uint64     // 当前任期
-	votedFor int32      // 本任期投票给了哪个节点，-1代表本任期内未投票
-	logs     []*raftLog // 日志条目
+	term          TermType // 当前任期
+	votedFor      int32    // 本任期投票给了哪个节点，-1代表本任期内未投票
+	logs          []*Log   // 日志条目
+	totalNoOPLogs uint64   // 总的NO-OP日志条数
 
-	// 持久化字段，非Raft必须，仅用于优化
-	logTermsLast  map[uint64]uint64 // 记录日志中的term号，及该任期内的最后一条日志索引位置
-	logTermsFirst map[uint64]uint64 // 记录日志中的term号，及该任期内的第一条日志索引位置
+	// 持久化字段，非Raft必须
+	// 用于加速leader计算follower当前日志进度，索引和任期范围和logs一致
+	LastIndexPerTerm  map[TermType]uint64 // 记录日志中的term号，及该任期内的最后一条日志索引位置
+	FirstIndexPerTerm map[TermType]uint64 // 记录日志中的term号，及该任期内的第一条日志索引位置
 
-	nextIndex    []uint64      // leader维护的下一次AppendEntry需要发送给各节点的日志条目索引
-	matchIndex   []uint64      // leader维护的各节点日志条目已同步的最高索引
-	commitIndex  uint64        // 日志条目已提交索引
-	lastApplied  uint64        // 本节点日志条目已应用索引
-	applyMsgChan chan ApplyMsg // 本节点日志条目应用目标chan
+	nextAppendEntryIndex []uint64      // leader维护的下一次AppendEntry需要发送给各节点的日志条目索引，初始为日志末尾
+	matchIndex           []uint64      // leader维护的各节点日志条目已同步的最高索引，初始为0
+	commitIndex          uint64        // leader维护的日志条目已提交索引
+	lastAppliedIndex     uint64        // 本节点日志条目已应用索引，含NO-OP日志。节点重建后需要重新应用日志，因此不需要持久化
+	lastAppliedOPIndex   uint64        // 不含NO-OP日志的已应用索引，用于维护状态机应用进度。
+	applyMsgChan         chan ApplyMsg // 本节点日志条目应用目标chan
 
 	// 用于调试记录的字段
 	appendEntryTimes uint32 // 发起追加日志条目RPC次数
@@ -100,15 +124,13 @@ func (rf *Raft) GetState() (termNo int, isLeader bool) {
 	defer rf.mu.Unlock()
 
 	termNo = int(rf.term)
-	isLeader = rf.role == raftLeader
+	isLeader = rf.role == Leader
 	return
 }
 
-//
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-//
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -119,8 +141,14 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 
+	data := rf.buildPersistBytes()
+	rf.persister.SaveRaftState(data)
+}
+
+func (rf *Raft) buildPersistBytes() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+
 	if err := e.Encode(rf.term); err != nil {
 		panic(err)
 	}
@@ -130,22 +158,46 @@ func (rf *Raft) persist() {
 	if err := e.Encode(rf.logs); err != nil {
 		panic(err)
 	}
-	if err := e.Encode(rf.logTermsFirst); err != nil {
+	if err := e.Encode(rf.totalNoOPLogs); err != nil {
 		panic(err)
 	}
-	if err := e.Encode(rf.logTermsLast); err != nil {
+	if err := e.Encode(rf.FirstIndexPerTerm); err != nil {
 		panic(err)
 	}
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	if err := e.Encode(rf.LastIndexPerTerm); err != nil {
+		panic(err)
+	}
+	return w.Bytes()
 }
 
-//
+func (rf *Raft) loadPersistData(data []byte) {
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	if err := d.Decode(&rf.term); err != nil {
+		panic(err)
+	}
+	if err := d.Decode(&rf.votedFor); err != nil {
+		panic(err)
+	}
+	if err := d.Decode(&rf.logs); err != nil {
+		panic(err)
+	}
+	if err := d.Decode(&rf.totalNoOPLogs); err != nil {
+		panic(err)
+	}
+	if err := d.Decode(&rf.FirstIndexPerTerm); err != nil {
+		panic(err)
+	}
+	if err := d.Decode(&rf.LastIndexPerTerm); err != nil {
+		panic(err)
+	}
+}
+
 // restore previously persisted state.
-//
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
-		rf.DPrintf("[Persist Loaded] for %d: none", rf.me)
+		DPrintf("[Persist Loaded] for %d: none", rf.me)
 		return
 	}
 	// Your code here (2C).
@@ -162,39 +214,12 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.yyy = yyy
 	// }
 
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	var term uint64
-	var votedFor int32
-	var logs = make([]*raftLog, 0)
-	var logTermsFirst = make(map[uint64]uint64)
-	var logTermsLast = make(map[uint64]uint64)
-
-	if err := d.Decode(&term); err != nil {
-		panic(err)
-	}
-	if err := d.Decode(&votedFor); err != nil {
-		panic(err)
-	}
-	if err := d.Decode(&logs); err != nil {
-		panic(err)
-	}
-	if err := d.Decode(&logTermsFirst); err != nil {
-		panic(err)
-	}
-	if err := d.Decode(&logTermsLast); err != nil {
-		panic(err)
-	}
-
-	rf.term, rf.votedFor, rf.logs = term, votedFor, logs
-	rf.logTermsFirst, rf.logTermsLast = logTermsFirst, logTermsLast
-
-	rf.DPrintf("[Persist Loaded] for %d: term: %d votedFor %d len(logs) %d len(mapFirst) %d len(mapLast) %d",
-		rf.me, rf.term, rf.votedFor, len(rf.logs), len(rf.logTermsFirst), len(rf.logTermsLast),
+	rf.loadPersistData(data)
+	DPrintf("[Persist Loaded] for %d: term: %d votedFor %d len(logs) %d len(mapFirst) %d len(mapLast) %d",
+		rf.me, rf.term, rf.votedFor, len(rf.logs), len(rf.FirstIndexPerTerm), len(rf.LastIndexPerTerm),
 	)
 }
 
-//
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -207,40 +232,49 @@ func (rf *Raft) readPersist(data []byte) {
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-//
 func (rf *Raft) Start(command interface{}) (index int, term int, leader bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.role != raftLeader {
+	if rf.role != Leader {
 		return 0, int(rf.term), false
 	}
 
 	// append log
-	log := &raftLog{
-		Term:  rf.term,
-		Entry: command,
+	log := &Log{
+		Term:    rf.term,
+		Command: command,
+		NoOp:    false,
 	}
-	rf.logs = append(rf.logs, log)
-	index = len(rf.logs) - 1
 
-	// update logTermsFirst logTermsLast
-	if _, ok := rf.logTermsFirst[rf.term]; !ok {
-		rf.logTermsFirst[rf.term] = uint64(index)
+	index = rf.WriteLog(log)
+
+	DPrintf("[Start] leader %d index %d term %d cmd %v logs %s", rf.me, index, rf.term, command, Logs(rf.logs))
+	return index, int(rf.term), true
+}
+
+func (rf *Raft) WriteLog(log *Log) int {
+	rf.logs = append(rf.logs, log)
+	index := len(rf.logs) - 1
+
+	if _, ok := rf.FirstIndexPerTerm[rf.term]; !ok {
+		rf.FirstIndexPerTerm[rf.term] = uint64(index)
 	}
-	rf.logTermsLast[rf.term] = uint64(index)
+	rf.LastIndexPerTerm[rf.term] = uint64(index)
+
+	if log.NoOp {
+		rf.totalNoOPLogs += 1
+	}
 
 	rf.persist()
 
 	// leader's matchIndex
 	rf.matchIndex[rf.me] = uint64(index)
 
-	rf.DPrintf("[Start] leader %d index %d term %d cmd %s logs %s", rf.me, index, rf.term, getMd5(command), logsToString(rf.logs))
-	return index, int(rf.term), true
+	return index - int(rf.totalNoOPLogs)
 }
 
-//
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -250,14 +284,14 @@ func (rf *Raft) Start(command interface{}) (index int, term int, leader bool) {
 // up CPU time, perhaps causing later tests to fail and generating
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
-//
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 
+	rf.stopCh <- struct{}{}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.DPrintf("<%d-%s>: signal killed %p", rf.me, rf.getRole(), rf)
+	DPrintf("<%d-%s>: signal killed %p", rf.me, rf.role, rf)
 }
 
 func (rf *Raft) killed() bool {
@@ -265,7 +299,6 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-//
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -275,7 +308,6 @@ func (rf *Raft) killed() bool {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-//
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
@@ -283,38 +315,35 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.applyMsgChan = applyCh
-	rf.lastApplied = 0
+	rf.lastAppliedIndex = 0
+	rf.lastAppliedOPIndex = 0
 	rf.commitIndex = 0
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.role = raftFollower
+	rf.role = Follower
 	rf.votedFor = -1
 	rf.term = 0
+	rf.stopCh = make(chan struct{})
 
-	rf.timer = time.NewTimer(getRandomDuration(ElectionTimeout, rf.me))
-	rf.timer.Stop()
-	rf.electionStopChan = make(chan struct{}, 1)
+	rf.electionTimer = time.NewTimer(GetRandomDuration(ElectionTimeout, rf.me))
+	rf.electionTimer.Stop()
+	rf.electionTimeoutSignal = make(chan struct{})
 	rf.voteCounter = NewVoteCounter(rf.me)
 
-	rf.logs = []*raftLog{{0, 0}} // log索引从1开始
-	rf.logTermsFirst = map[uint64]uint64{0: 0}
-	rf.logTermsLast = map[uint64]uint64{0: 0}
+	rf.logs = []*Log{{0, 0, false}} // log索引从1开始
+	rf.FirstIndexPerTerm = map[TermType]uint64{0: 0}
+	rf.LastIndexPerTerm = map[TermType]uint64{0: 0}
 
-	rf.nextIndex = make([]uint64, len(rf.peers))
+	rf.nextAppendEntryIndex = make([]uint64, len(rf.peers))
 	rf.matchIndex = make([]uint64, len(rf.peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = uint64(len(rf.logs)) // 初始值为leader最后一个日志条目的索引值+1
-		rf.matchIndex[i] = 0
-	}
-
 	go heartbeat(rf) // 心跳检测
 
 	go applier(rf) // 日志应用
 
-	rf.DPrintf("RAFT >>>>>>> %d", rf.me)
+	DPrintf("RAFT Start >>>>>>> %d", rf.me)
 	return rf
 }

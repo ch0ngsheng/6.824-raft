@@ -1,11 +1,63 @@
 package raft
 
-type reqVoteUtil struct {
+type VoteRPCUtil struct {
 }
 
-var rv = reqVoteUtil{}
+var voteRPCUtil = VoteRPCUtil{}
 
-func (reqVoteUtil) checkTermAndRole(rf *Raft, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+// RequestVoteArgs RequestVote RPC的请求参数
+type RequestVoteArgs struct {
+	Term         TermType
+	CandidateID  int
+	LastLogIndex uint64
+	LastLogTerm  TermType
+}
+
+// RequestVoteReply RequestVote RPC 的响应参数
+type RequestVoteReply struct {
+	Term  TermType
+	Voted bool
+}
+
+// RequestVote 处理 RequestVote RPC
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintf("[RPC Receive RV begin] me: %d, from: %d with term: %d",
+		rf.me, args.CandidateID, args.Term,
+	)
+	defer func() {
+		DPrintf("[RPC Receive RV end] me: %d, from: %d with term: %d, accepted: %v, args: %v, reply: %v",
+			rf.me, args.CandidateID, args.Term, reply.Voted, *args, *reply,
+		)
+	}()
+
+	if ok := voteRPCUtil.checkTermAndRole(rf, args, reply); !ok {
+		return
+	}
+
+	if voteRPCUtil.hasVoted(rf, args) {
+		// 本任期已投票
+		DPrintf("Receive RV, me: %d, from: %d with term: %d, accepted: false, for accepted already.",
+			rf.me, args.CandidateID, args.Term,
+		)
+		voteRPCUtil.deny(rf, reply)
+		return
+	}
+
+	if voteRPCUtil.canVote(rf, args) {
+		voteRPCUtil.vote(rf, args, reply)
+		return
+	}
+
+	DPrintf("Receive RV, me: %d, from: %d with term: %d, accepted: false, for old log.",
+		rf.me, args.CandidateID, args.Term,
+	)
+	voteRPCUtil.deny(rf, reply)
+}
+
+func (VoteRPCUtil) checkTermAndRole(rf *Raft, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	curTerm := rf.term
 	if args.Term < curTerm {
 		reply.Term = curTerm
@@ -15,21 +67,20 @@ func (reqVoteUtil) checkTermAndRole(rf *Raft, args *RequestVoteArgs, reply *Requ
 	}
 
 	if args.Term > curTerm {
-		rf.updateTermAndPersist(args.Term)
-		rf.switchRole(raftFollower)
+		rf.switchToFollowerAndPersist(args.Term)
 	}
 
 	return true
 }
 
-func (reqVoteUtil) hasVoted(rf *Raft, args *RequestVoteArgs) bool {
+func (VoteRPCUtil) hasVoted(rf *Raft, args *RequestVoteArgs) bool {
 	if rf.votedFor == -1 || rf.votedFor == int32(args.CandidateID) {
 		return false
 	}
 	return true
 }
 
-func (reqVoteUtil) canVote(rf *Raft, args *RequestVoteArgs) bool {
+func (VoteRPCUtil) canVote(rf *Raft, args *RequestVoteArgs) bool {
 	lastLogIndex, lastLogTerm := rf.getLastLogNumber()
 	if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex) {
 		return true
@@ -37,72 +88,19 @@ func (reqVoteUtil) canVote(rf *Raft, args *RequestVoteArgs) bool {
 	return false
 }
 
-func (reqVoteUtil) vote(rf *Raft, args *RequestVoteArgs, reply *RequestVoteReply) {
+func (VoteRPCUtil) vote(rf *Raft, args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Voted = true
 	reply.Term = rf.term
 
 	rf.updateVotedForAndPersist(int32(args.CandidateID))
-	rf.rstElectionTimer()
+	rf.resetElectionTimer()
 }
 
-func (reqVoteUtil) deny(rf *Raft, reply *RequestVoteReply) {
+func (VoteRPCUtil) deny(rf *Raft, reply *RequestVoteReply) {
 	reply.Voted = false
 	reply.Term = rf.term
 }
 
-// RequestVoteArgs Request Vote RPC的请求参数
-type RequestVoteArgs struct {
-	Term         uint64
-	CandidateID  int
-	LastLogIndex uint64
-	LastLogTerm  uint64
-}
-
-// RequestVoteReply Request Vote RPC 的响应参数
-type RequestVoteReply struct {
-	Term  uint64
-	Voted bool
-}
-
-// RequestVote 处理 Request Vote RPC
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	rf.DPrintf("[RPC Receive RV begin] me: %d, from: %d with term: %d",
-		rf.me, args.CandidateID, args.Term,
-	)
-	defer func() {
-		rf.DPrintf("[RPC Receive RV end] me: %d, from: %d with term: %d, voted: %v, args: %v, reply: %v",
-			rf.me, args.CandidateID, args.Term, reply.Voted, *args, *reply,
-		)
-	}()
-
-	if ok := rv.checkTermAndRole(rf, args, reply); !ok {
-		return
-	}
-
-	if rv.hasVoted(rf, args) {
-		// 本任期已投票
-		rf.DPrintf("Receive RV, me: %d, from: %d with term: %d, voted: false, for voted already.",
-			rf.me, args.CandidateID, args.Term,
-		)
-		rv.deny(rf, reply)
-		return
-	}
-
-	if rv.canVote(rf, args) {
-		rv.vote(rf, args, reply)
-		return
-	}
-
-	rf.DPrintf("Receive RV, me: %d, from: %d with term: %d, voted: false, for old log.",
-		rf.me, args.CandidateID, args.Term,
-	)
-	rv.deny(rf, reply)
-}
-
-//
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -130,7 +128,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-//
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	// blocked, guaranteed to return, have a delay， no need to implement your own timeouts
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)

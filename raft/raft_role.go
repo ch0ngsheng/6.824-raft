@@ -1,13 +1,13 @@
 package raft
 
 const (
-	raftFollower uint32 = iota
-	raftLeader
-	raftCandidate
+	Follower uint32 = iota
+	Leader
+	Candidate
 
-	raftFollowerRole  = "follower"
-	raftLeaderRole    = "leader"
-	raftCandidateRole = "candidate"
+	FollowerRole  = "follower"
+	LeaderRole    = "leader"
+	CandidateRole = "candidate"
 )
 
 var roleMap = map[uint32]string{}
@@ -17,13 +17,13 @@ type heartbeatHandler func(raft *Raft)
 var heartbeatHandlerMap = map[uint32]heartbeatHandler{}
 
 func init() {
-	roleMap[raftFollower] = raftFollowerRole
-	roleMap[raftCandidate] = raftCandidateRole
-	roleMap[raftLeader] = raftLeaderRole
+	roleMap[Follower] = FollowerRole
+	roleMap[Candidate] = CandidateRole
+	roleMap[Leader] = LeaderRole
 
-	heartbeatHandlerMap[raftFollower] = followerHandler
-	heartbeatHandlerMap[raftCandidate] = candidateHandler
-	heartbeatHandlerMap[raftLeader] = leaderHandler
+	heartbeatHandlerMap[Follower] = followerHandler
+	heartbeatHandlerMap[Candidate] = candidateHandler
+	heartbeatHandlerMap[Leader] = leaderHandler
 }
 
 // leaderHandler leader的心跳定时器到期
@@ -33,14 +33,7 @@ func leaderHandler(rf *Raft) {
 
 // candidateHandler candidate的心跳定时器到期
 func candidateHandler(rf *Raft) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.role != raftCandidate {
-		return
-	}
-	rf.electionStopChan <- struct{}{} // 选举超时
-	rf.DPrintf("HB: <%d-%s>: (election timeout)", rf.me, rf.getRole())
+	requestVoteTimeout(rf)
 }
 
 // followerHandler follower的心跳定时器到期
